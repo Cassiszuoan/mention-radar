@@ -1,0 +1,40 @@
+# Daily batch path: retention / compliance / maintenance (01:17 UTC, off-peak
+# minute). Also hosts the keepalive step that defeats GitHub's 60-day
+# scheduled-workflow auto-disable on public repos (workflow runs themselves do
+# NOT count as repo activity — only commits do).
+name: retention
+
+on:
+  schedule:
+    - cron: "17 1 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: retention
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # keepalive commits a dummy bump when repo is >45d quiet
+
+jobs:
+  daily:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      YT_API_KEY: ${{ secrets.YT_API_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      CONTACT_EMAIL: ${{ secrets.CONTACT_EMAIL }}
+      HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: retention + compliance
+        run: python -m pipeline.run retention
+      - name: keepalive (prevents 60-day cron auto-disable)
+        uses: gautamkrishnar/keepalive-workflow@v2

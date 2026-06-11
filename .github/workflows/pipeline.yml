@@ -1,0 +1,44 @@
+# Near-real-time path: ingest → sentiment → aggregate+detect, every 20 minutes.
+# - Off-peak minutes (7,27,47) dodge GitHub's top-of-hour cron congestion.
+# - Single job, sequential steps = hard ordering guarantee; the concurrency
+#   group (cancel-in-progress: false) prevents overlapping cycles.
+# - Logging discipline: steps print counts/ids only — run logs are PUBLIC.
+name: pipeline
+
+on:
+  schedule:
+    - cron: "7,27,47 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: pipeline
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  cycle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      YT_API_KEY: ${{ secrets.YT_API_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      CONTACT_EMAIL: ${{ secrets.CONTACT_EMAIL }}
+      APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+      HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: ingest
+        run: python -m pipeline.run ingest
+      - name: sentiment
+        run: python -m pipeline.run sentiment
+      - name: aggregate + detect
+        run: python -m pipeline.run aggregate_detect

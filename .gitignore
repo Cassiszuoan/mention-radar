@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+.venv/
+venv/
+node_modules/
+dashboard/dist/
+dashboard/.env*
+!dashboard/.env.example
+*.log
+.DS_Store
+seed.local.sql

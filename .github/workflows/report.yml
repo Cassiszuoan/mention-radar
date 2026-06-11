@@ -1,0 +1,51 @@
+# Reports: weekly every Monday 01:07 UTC (= 09:07 Taipei), monthly on the 1st.
+name: report
+
+on:
+  schedule:
+    - cron: "7 1 * * 1"    # weekly
+    - cron: "37 1 1 * *"   # monthly
+  workflow_dispatch:
+    inputs:
+      period:
+        description: "report period"
+        type: choice
+        options: [weekly, monthly]
+        default: weekly
+
+concurrency:
+  group: report
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      YT_API_KEY: ${{ secrets.YT_API_KEY }}
+      CONTACT_EMAIL: ${{ secrets.CONTACT_EMAIL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: pick period
+        id: period
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "period=${{ inputs.period }}" >> "$GITHUB_OUTPUT"
+          elif [ "$(date -u +%d)" = "01" ] && [ "${{ github.event.schedule }}" = "37 1 1 * *" ]; then
+            echo "period=monthly" >> "$GITHUB_OUTPUT"
+          else
+            echo "period=weekly" >> "$GITHUB_OUTPUT"
+          fi
+      - name: generate report
+        run: python -m pipeline.run report --period "${{ steps.period.outputs.period }}"
