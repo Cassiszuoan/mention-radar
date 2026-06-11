@@ -12,3 +12,5 @@ dashboard/.env*
 *.log
 .DS_Store
 seed.local.sql
+
+.claude/
