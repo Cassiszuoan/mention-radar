@@ -16,7 +16,9 @@ GitHub Actions (cron :07/:27/:47)            Supabase (free tier)
                                                  └───────────┘
 ```
 
-* **Design doc**: the approved system design lives with the operator
+* **接手 / 換電腦的 AI agent**: 先讀 [docs/HANDOFF.md](docs/HANDOFF.md)（狀態、待辦、
+  不可重複踩的研究結論、環境備註）。Claude Code 開此 repo 會自動載入根目錄 `CLAUDE.md`。
+* **Design doc**: [docs/DESIGN.md](docs/DESIGN.md) — the approved system design
   (architecture, alert math, retention/ToS rules, cost model). Code comments
   reference its review fixes.
 * **Setup**: [docs/SETUP.md](docs/SETUP.md) — Supabase project, API keys,
