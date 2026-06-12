@@ -5,12 +5,14 @@
 import "./style.css";
 import { api, sb } from "./api";
 import type { Alert, Entity } from "./api";
+import { disposeCharts } from "./charts";
 import { renderAlerts, renderEntity, renderOverview, renderReports } from "./views";
 
 const app = document.getElementById("app")!;
 const POLL_MS = 60_000;
 
 let pollTimer: number | undefined;
+let gen = 0;  // refresh generation: stale in-flight renders bail after each await
 const detailState = { range: "7d", platform: "", sourceId: "", order: "latest" };
 
 // ---------------------------------------------------------------------------
@@ -94,6 +96,12 @@ function activeTab(): string {
 async function refresh(): Promise<void> {
   const view = document.getElementById("view");
   if (!view) return;
+  // generation guard: five trigger sources (poll, hashchange, ack, visibility,
+  // filters) can overlap; a stale in-flight render must not overwrite a newer
+  // one. Bail after every await if a newer refresh has started.
+  const my = ++gen;
+  const alive = () => my === gen;
+  disposeCharts();  // tear down previous render's chart instances first
   document.querySelectorAll<HTMLAnchorElement>("nav.tabs a").forEach((a) =>
     a.classList.toggle("active", a.dataset.tab === activeTab()));
   try {
@@ -103,22 +111,28 @@ async function refresh(): Promise<void> {
       const [entities, alerts, sources] = await Promise.all([
         api.entities(), api.alerts(false), api.sources(),
       ]);
+      if (!alive()) return;
       const ent = entities.find((e: Entity) => e.slug === slug);
       if (!ent) { view.innerHTML = `<div class="empty">找不到實體 ${slug}</div>`; return; }
-      await renderEntity(view, ent, alerts, sources, detailState);
+      await renderEntity(view, ent, alerts, sources, detailState, alive);
+      if (!alive()) return;
       wireDetailFilters(view);
     } else if (h.startsWith("#/alerts")) {
-      renderAlerts(view, await api.alerts(false));
+      const alerts = await api.alerts(false);
+      if (!alive()) return;
+      renderAlerts(view, alerts);
     } else if (h.startsWith("#/reports")) {
-      await renderReports(view);
+      await renderReports(view, alive);
     } else {
       const since = new Date(Date.now() - 8 * 86400e3).toISOString();
       const [entities, agg, alerts, quality] = await Promise.all([
         api.entities(), api.aggHourly(since), api.alerts(true) as Promise<Alert[]>, api.quality(),
       ]);
+      if (!alive()) return;
       renderOverview(view, entities, agg, alerts, quality);
     }
   } catch (err) {
+    if (!alive()) return;
     view.innerHTML = `<div class="empty">讀取失敗(${(err as { message?: string })?.message ?? "未知錯誤"})
       — 60 秒後自動重試</div>`;
   }

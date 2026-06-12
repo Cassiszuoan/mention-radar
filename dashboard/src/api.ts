@@ -17,9 +17,10 @@ export type AggRow = {
 };
 export type Alert = {
   id: number; entity_id: number; type: string; severity: "watch" | "high";
-  triggered_at: string; window_start: string; observed: number | null;
-  baseline: number | null; zscore: number | null; status: string;
-  evidence: { items?: EvidenceItem[] } | null; slug: string; name: string;
+  triggered_at: string; window_start: string; window_end: string | null;
+  observed: number | null; baseline: number | null; zscore: number | null;
+  status: string; evidence: { items?: EvidenceItem[] } | null;
+  slug: string; name: string;
 };
 export type EvidenceItem = {
   url?: string; platform?: string; published_at?: string;
@@ -30,6 +31,7 @@ export type MentionRow = {
   platform: string; source_id: number | null; kind: string; url: string | null;
   title: string | null; body: string | null; body_purged_at: string | null;
   lang: string | null; published_at: string; metrics: Record<string, number>;
+  engagement: number | null;
   sentiment: number | null; label: string | null; aspects: { name: string; score: number }[] | null;
 };
 
@@ -69,8 +71,11 @@ export const api = {
       return q as never;
     }),
 
+  // Route through 401-recovery and surface failures: .select() makes a
+  // 0-rows-updated (RLS/grant denial) detectable instead of a silent no-op.
   ackAlert: (id: number, status: "ack" | "resolved") =>
-    sb.from("alerts").update({ status }).eq("id", id),
+    withRetry<{ id: number }[]>(() =>
+      sb.from("alerts").update({ status }).eq("id", id).select("id") as never),
 
   mentions: (entityId: number, sinceIso: string, order: "latest" | "negative" | "engaged",
              platform?: string, sourceId?: number) =>
@@ -80,6 +85,7 @@ export const api = {
       if (platform) q = q.eq("platform", platform);
       if (sourceId != null) q = q.eq("source_id", sourceId);
       if (order === "negative") q = q.order("sentiment", { ascending: true, nullsFirst: false });
+      else if (order === "engaged") q = q.order("engagement", { ascending: false, nullsFirst: false });
       else q = q.order("published_at", { ascending: false });
       return q as never;
     }),

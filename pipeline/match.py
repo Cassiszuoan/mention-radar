@@ -51,7 +51,11 @@ def build_matchers(keyword_rows: list[dict], stats=None) -> list[Matcher]:
         mt = kw.get("match_type", "phrase")
         try:
             if mt == "regex":
-                rx = re.compile(norm)  # may raise re.error
+                # Compile the RAW operator pattern — do NOT casefold/NFKC it.
+                # casefold() would turn \B→\b, \W→\w, \D→\d, \S→\s and NFKC could
+                # turn full-width punctuation into regex metacharacters. Text is
+                # matched as NFKC+casefolded, so use IGNORECASE here.
+                rx = re.compile(raw, re.IGNORECASE)  # may raise re.error
                 test = rx.search
             elif has_cjk(norm) or mt == "phrase":
                 # plain substring; capture norm by default-arg

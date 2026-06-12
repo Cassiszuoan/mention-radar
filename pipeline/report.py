@@ -145,7 +145,7 @@ def _top_mentions(cfg: Config, start, end) -> tuple[list[dict], list[dict]]:
                 item["quote"] = text.strip()[:240]
             out.append(item)
         if yt_to_paraphrase:
-            paras = _paraphrase([t for _, t in yt_to_paraphrase])
+            paras = _paraphrase(cfg, [t for _, t in yt_to_paraphrase])
             for (item, _), p in zip(yt_to_paraphrase, paras):
                 item["quote"] = f"(改寫){p}"
         for item in out:
@@ -198,13 +198,7 @@ def _gemini_text(cfg: Config, prompt: str) -> str | None:
         return None
 
 
-_PARA_CFG: Config | None = None  # set in run() chain via _top_mentions closure
-
-
-def _paraphrase(texts: list[str]) -> list[str]:
-    cfg = _PARA_CFG
-    if cfg is None:
-        return ["(略)"] * len(texts)
+def _paraphrase(cfg: Config, texts: list[str]) -> list[str]:
     numbered = "\n".join(f"{i}. {t}" for i, t in enumerate(texts))
     out = _gemini_text(cfg, "將每則留言改寫成一句中立轉述(保留情緒傾向與重點,"
                             "禁止逐字引用),回傳 JSON 陣列(字串,依編號順序):\n" + numbered)
@@ -218,8 +212,6 @@ def _paraphrase(texts: list[str]) -> list[str]:
 
 
 def _narrative(cfg: Config, period: str, scorecards, alerts) -> str | None:
-    global _PARA_CFG
-    _PARA_CFG = cfg
     compact = {
         "scorecards": scorecards,
         "alerts": [{"entity": (a.get("entities") or {}).get("name"),

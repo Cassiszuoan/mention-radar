@@ -101,6 +101,12 @@ create table agg_hourly (
 );
 
 create table agg_daily (like agg_hourly including all);
+-- LIKE ... INCLUDING ALL copies columns/PK/checks but NOT foreign keys; add it
+-- back so deleting an entity cascades (agg_daily is permanent — orphans would
+-- accumulate against the 500MB budget and be invisible behind v_agg_daily).
+alter table agg_daily
+  add constraint agg_daily_entity_fk foreign key (entity_id)
+  references entities(id) on delete cascade;
 
 create table alerts (
   id            bigint generated always as identity primary key,
@@ -175,7 +181,7 @@ insert into app_config (key, value) values
 create or replace function fn_recompute_agg(p_hours int default 72, p_days int default 7)
 returns void
 language plpgsql
-security definer set search_path = public
+security definer set search_path = public set timezone = 'UTC'
 as $$
 declare
   h_from timestamptz := date_trunc('hour', now()) - make_interval(hours => p_hours);
@@ -236,7 +242,7 @@ returns table (
 )
 language sql
 stable
-security definer set search_path = public
+security definer set search_path = public set timezone = 'UTC'
 as $$
 with counts as (
   select a.entity_id, a.bucket, sum(a.mention_n)::bigint as n
@@ -251,10 +257,17 @@ eval_buckets as (
   cross join generate_series(1, p_buckets) as i(i)
   where e.active
 ),
+first_data as (
+  select entity_id, min(bucket) as first_bucket from agg_hourly group by 1
+),
 cur as (
-  select b.entity_id, b.bucket, coalesce(c.n, 0) as current_n, b.created_at
+  select b.entity_id, b.bucket, coalesce(c.n, 0) as current_n,
+         -- warmup proxy = data coverage, not entity-row age (entities are seeded
+         -- in Phase 0 before ingest starts, so created_at would falsely clear warmup)
+         greatest(b.created_at, coalesce(f.first_bucket, now())) as coverage_start
   from eval_buckets b
   left join counts c on c.entity_id = b.entity_id and c.bucket = b.bucket
+  left join first_data f on f.entity_id = b.entity_id
 ),
 base as (
   select b.entity_id, b.bucket,
@@ -274,7 +287,7 @@ select cur.entity_id,
        round(base.mu, 3),
        round(base.sigma, 3),
        round((cur.current_n - base.mu) / greatest(base.sigma, 1), 3) as z,
-       extract(epoch from (now() - cur.created_at)) / 3600.0 as data_age_hours
+       extract(epoch from (now() - cur.coverage_start)) / 3600.0 as data_age_hours
 from cur
 join base on base.entity_id = cur.entity_id and base.bucket = cur.bucket;
 $$;
@@ -293,7 +306,7 @@ returns table (
 )
 language sql
 stable
-security definer set search_path = public
+security definer set search_path = public set timezone = 'UTC'
 as $$
 with w as (
   select date_trunc('hour', now()) - make_interval(hours => p_window_hours) as w_start,
@@ -316,6 +329,9 @@ base as (
   where a.bucket >= w.w_start - make_interval(days => p_baseline_days)
     and a.bucket <  w.w_start
   group by 1
+),
+first_data as (
+  select entity_id, min(bucket) as first_bucket from agg_hourly group by 1
 )
 select e.id,
        w.w_start,
@@ -324,11 +340,13 @@ select e.id,
        coalesce(cur.analyzed_n, 0),
        coalesce(cur.mention_n, 0),
        round(coalesce(cur.analyzed_n, 0)::numeric / nullif(cur.mention_n, 0), 3),
-       extract(epoch from (now() - e.created_at)) / 3600.0
+       -- warmup proxy = data coverage, not entity-row age
+       extract(epoch from (now() - greatest(e.created_at, coalesce(fd.first_bucket, now())))) / 3600.0
 from entities e
 cross join w
 left join cur  on cur.entity_id  = e.id
 left join base on base.entity_id = e.id
+left join first_data fd on fd.entity_id = e.id
 where e.active;
 $$;
 
@@ -336,7 +354,7 @@ $$;
 -- alert at 350MB, well before the 500MB read-only line).
 create or replace function fn_db_size()
 returns bigint language sql stable
-security definer set search_path = public
+security definer set search_path = public set timezone = 'UTC'
 as $$ select pg_database_size(current_database()); $$;
 
 -- Keep detector/aggregation functions out of client reach.
@@ -365,6 +383,10 @@ create view v_mentions with (security_invoker = true) as
   select me.entity_id, e.slug, e.name, e.side,
          m.id as mention_id, m.platform, m.source_id, m.kind, m.url, m.title,
          m.body, m.body_purged_at, m.lang, m.published_at, m.metrics,
+         -- cross-platform engagement (reddit score / youtube likes) for the
+         -- "最高互動" mention-stream sort
+         greatest(coalesce((m.metrics->>'score')::int, 0),
+                  coalesce((m.metrics->>'likes')::int, 0)) as engagement,
          me.sentiment, me.label, me.confidence, me.aspects
   from mention_entities me
   join mentions m on m.id = me.mention_id
@@ -394,7 +416,11 @@ alter table pipeline_runs    enable row level security;
 -- Supabase grants broad table privileges to anon/authenticated by default;
 -- strip them so RLS is not the only line of defense.
 revoke all on all tables in schema public from anon;
-revoke insert, update, delete on all tables in schema public from authenticated;
+-- Full reset then explicit SELECT: removes TRUNCATE/REFERENCES/TRIGGER (TRUNCATE
+-- isn't governed by RLS) and makes the SELECT that auth_select policies depend on
+-- explicit, instead of silently inherited from Supabase default privileges.
+revoke all on all tables in schema public from authenticated;
+grant select on all tables in schema public to authenticated;
 
 -- Operator (authenticated) read policies. Sensitive config stays read-VISIBLE
 -- (operator needs to see thresholds in the dashboard) but not writable here;

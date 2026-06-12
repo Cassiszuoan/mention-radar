@@ -17,10 +17,15 @@ Severity (review fix): for quiet entities the sigma floor makes z explode
 from __future__ import annotations
 
 import json
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from . import db
 from .config import Config, entity_thresholds
+
+
+def _plus_hours(iso_ts: str, hours: int) -> str:
+    dt = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
+    return db.iso(dt + timedelta(hours=hours))
 
 
 def run(cfg: Config, stats) -> None:
@@ -56,7 +61,7 @@ def _check_volume(cfg: Config, defaults: dict, stats) -> None:
             cfg, stats,
             entity_id=r["entity_id"], type_="volume_spike", severity=severity,
             window_start=r["window_start"],
-            window_end=None,
+            window_end=_plus_hours(r["window_start"], 1),  # 1h bucket
             observed=n, baseline=float(r["mu"] or 0), zscore=z,
             cooldown_h=float(th.get("cooldown_hours", 12)),
         )
@@ -93,7 +98,8 @@ def _check_sentiment(cfg: Config, defaults: dict, stats) -> None:
         _upsert_alert(
             cfg, stats,
             entity_id=r["entity_id"], type_="sentiment_drop", severity=severity,
-            window_start=r["window_start"], window_end=None,
+            window_start=r["window_start"],
+            window_end=_plus_hours(r["window_start"], int(s.get("window_hours", 24))),
             observed=float(r["current_avg"]), baseline=float(r["baseline_avg"]),
             zscore=round(drop, 3),
             cooldown_h=float(th.get("cooldown_hours", 12)),
@@ -126,17 +132,28 @@ def _upsert_alert(cfg: Config, stats, *, entity_id: int, type_: str, severity: s
             stats.incr("alerts_escalated")
         return
 
-    # cross-window cooldown: an open/recent alert of the same type suppresses
-    # new windows (escalation above is exempt)
+    # cross-window cooldown: a recent alert of the same type suppresses new
+    # windows — EXCEPT when the new severity outranks it. A deteriorating
+    # incident must be able to surface as 'high' even if a 'watch' fired <12h
+    # ago (the operator's high=coral banner / PR escalation depends on it).
     cutoff = db.iso(db.now_utc() - timedelta(hours=cooldown_h))
     recent = (
-        c.table("alerts").select("id")
+        c.table("alerts").select("id, severity")
         .eq("entity_id", entity_id).eq("type", type_)
         .gte("triggered_at", cutoff)
+        .order("triggered_at", desc=True)
         .limit(1).execute().data
     )
     if recent:
-        stats.incr("alerts_cooldown_suppressed")
+        cur = recent[0]
+        if _SEV_RANK[severity] > _SEV_RANK.get(cur["severity"], 0):
+            c.table("alerts").update({
+                "severity": severity, "observed": observed,
+                "baseline": baseline, "zscore": zscore,
+            }).eq("id", cur["id"]).execute()
+            stats.incr("alerts_escalated")
+        else:
+            stats.incr("alerts_cooldown_suppressed")
         return
 
     evidence = _build_evidence(cfg, entity_id, window_start)

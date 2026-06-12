@@ -56,19 +56,31 @@ def run(cfg: Config, stats) -> None:
     channel_sources = [s for s in cfg.sources if s["platform"] == "youtube" and s["kind"] == "channel"]
     search_sources = [s for s in cfg.sources if s["platform"] == "youtube" and s["kind"] == "search"]
 
-    # 1. RSS new-video detection (0 units) + search discovery (own bucket)
+    # 1. RSS new-video detection (0 units) + search discovery (own bucket).
+    #    Skip the write phases once the daily write cap is exhausted (mirrors
+    #    ingest_reddit) so we never register videos we couldn't store.
     for src in channel_sources:
+        if writer.remaining == 0:
+            break
         _poll_channel_rss(src, cfg, writer, stats)
     for src in search_sources:
+        if writer.remaining == 0:
+            break
         _maybe_search(src, cfg, writer, stats)
 
     # 2. Stats gate over every active video (cheap, every cycle)
     video_index = _collect_active_videos(cfg)
     _stats_gate(video_index, stats)
 
-    # 3. Comments, gated + tiered + budget-guarded
-    hourly_tier_allowed = db.now_utc().minute < 20  # first cycle of each hour
+    # 3. Comments, gated + tiered + budget-guarded.
+    #    Hourly tier uses a persisted timestamp, not minute<20 — GHA cron jitter
+    #    (5-30 min) regularly pushes the :07 run past :20, silently skipping it.
+    istate = db.get_app_config("ingest_state", default={})
+    last_hourly = istate.get("yt_last_hourly_tier_at")
+    hourly_tier_allowed = (last_hourly is None) or \
+        (_age_hours(last_hourly) >= 0.92)  # ~55 min
     every_cycle_h = float(cfg.ingest.get("yt_every_cycle_hours", 72))
+    hourly_tier_ran = False
     for (src, vid), v in video_index.items():
         if v.get("comments_disabled"):
             continue
@@ -87,17 +99,28 @@ def run(cfg: Config, stats) -> None:
         if writer.remaining == 0:
             break
         try:
-            _fetch_comments(src, vid, v, writer, stats)
+            capped = _fetch_comments(src, vid, v, writer, stats)
+            if age_h > every_cycle_h:
+                hourly_tier_ran = True
+            # Only close the commentCount gate when we actually drained the new
+            # comments. On cap (capped) or exception, leave it open so the next
+            # cycle retries instead of permanently skipping the new comments.
+            if not capped:
+                v["last_comment_count"] = int(v.get("comment_count", 0))
         except CommentsDisabled:
             v["comments_disabled"] = True
+            v["last_comment_count"] = int(v.get("comment_count", 0))
         except requests.RequestException:
-            stats.incr("yt_comment_errors")
-        v["last_comment_count"] = int(v.get("comment_count", 0))
+            stats.incr("yt_comment_errors")  # gate stays open → retried next cycle
 
-    # 4. Persist per-source video state
+    # 4. Persist per-source video state + the hourly-tier timestamp
     for src, scfg in _DIRTY_SOURCE_CONFIGS.items():
         save_source_config(src, scfg)
     _DIRTY_SOURCE_CONFIGS.clear()
+    if hourly_tier_ran:
+        istate["yt_last_hourly_tier_at"] = db.iso(db.now_utc())
+        db.client().table("app_config").upsert(
+            {"key": "ingest_state", "value": istate}, on_conflict="key").execute()
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +173,13 @@ def _age_hours(published_iso: str | None) -> float:
     return (db.now_utc() - dt).total_seconds() / 3600.0
 
 
+def _z(dt: datetime) -> str:
+    """Canonical RFC3339 'Z', whole seconds — the only form YouTube's
+    publishedAfter reliably accepts (db.iso() emits microseconds + numeric
+    offset, which can 400 invalidSearchFilter)."""
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 # ---------------------------------------------------------------------------
 # 1a. Channel RSS (0 quota)
 # ---------------------------------------------------------------------------
@@ -178,31 +208,35 @@ def _poll_channel_rss(src: dict, cfg: Config, writer: MentionWriter, stats) -> N
         title = entry.findtext(f"{_ATOM}title") or ""
         desc = entry.findtext(f"{_MEDIA}group/{_MEDIA}description") or ""
         author = entry.findtext(f"{_ATOM}author/{_ATOM}name")
-        if vid not in state["videos"]:
-            if _age_hours(published) <= active_days * 24:
-                state["videos"][vid] = {
-                    "published": published,
-                    "last_comment_count": 0,
-                    "last_comment_ts": None,
-                    "threads": {},
-                }
-            rows.append({
-                "platform": "youtube",
-                "source_id": src["id"],
-                "external_id": vid,
-                "kind": "video",
-                "parent_external_id": None,
-                "url": f"https://www.youtube.com/watch?v={vid}",
-                "author_hash": author_hash("youtube", author),
-                "title": title,
-                "body": desc[:5000],
-                "published_at": published,
-                "metrics": {},
-                "_match_text": f"{title}\n{desc}",
-            })
+        if vid in state["videos"] or _age_hours(published) > active_days * 24:
+            continue
+        rows.append({
+            "platform": "youtube",
+            "source_id": src["id"],
+            "external_id": vid,
+            "kind": "video",
+            "parent_external_id": None,
+            "url": f"https://www.youtube.com/watch?v={vid}",
+            "author_hash": author_hash("youtube", author),
+            "title": title,
+            "body": desc[:5000],
+            "published_at": published,
+            "metrics": {},
+            "_match_text": f"{title}\n{desc}",
+        })
     if rows:
         rows.sort(key=lambda r: r["published_at"])
-        writer.write_batch(rows)
+        result = writer.write_batch([dict(r) for r in rows])
+        # Register for comment tracking ONLY videos whose row was safely written
+        # (within safe_count). On cap, unwritten videos stay unregistered and are
+        # retried next cycle instead of silently lost.
+        for r in rows[: result.safe_count]:
+            state["videos"][r["external_id"]] = {
+                "published": r["published_at"],
+                "last_comment_count": 0,
+                "last_comment_ts": None,
+                "threads": {},
+            }
 
     # prune videos out of the active window
     state["videos"] = {
@@ -220,7 +254,15 @@ def _maybe_search(src: dict, cfg: Config, writer: MentionWriter, stats) -> None:
     last = state.get("last_search_at")
     if last and _age_hours(last) < SEARCH_MIN_INTERVAL_H:
         return
-    published_after = state.get("search_cursor") or db.iso(db.now_utc() - timedelta(days=7))
+    # Overlap-cursor: search.list indexing lags, so query from cursor − margin
+    # (canonical Z form) and let unique(platform,external_id) dedup the overlap.
+    margin_h = float(cfg.ingest.get("yt_search_margin_hours", 12))
+    cursor_iso = state.get("search_cursor")
+    if cursor_iso:
+        base_dt = datetime.fromisoformat(cursor_iso.replace("Z", "+00:00")) \
+            - timedelta(hours=margin_h)
+    else:
+        base_dt = db.now_utc() - timedelta(days=7)
     try:
         data = _yt_get("search", {
             "part": "snippet",
@@ -228,21 +270,20 @@ def _maybe_search(src: dict, cfg: Config, writer: MentionWriter, stats) -> None:
             "type": "video",
             "order": "date",
             "maxResults": 50,
-            "publishedAfter": published_after,
+            "publishedAfter": _z(base_dt),
         }, stats, unit_key="yt_search_calls")
     except requests.RequestException:
         stats.incr("yt_search_errors")
         return
     state["last_search_at"] = db.iso(db.now_utc())
 
-    rows, newest = [], published_after
+    rows = []
     for item in data.get("items", []):
         vid = (item.get("id") or {}).get("videoId")
         sn = item.get("snippet") or {}
         if not vid:
             continue
-        published = sn.get("publishedAt") or db.iso(db.now_utc())
-        newest = max(newest, published)
+        published = sn.get("publishedAt") or _z(db.now_utc())
         title, desc = sn.get("title", ""), sn.get("description", "")
         rows.append({
             "platform": "youtube",
@@ -258,17 +299,23 @@ def _maybe_search(src: dict, cfg: Config, writer: MentionWriter, stats) -> None:
             "metrics": {},
             "_match_text": f"{title}\n{desc}",
         })
-        if vid not in state["videos"]:
-            state["videos"][vid] = {
-                "published": published,
-                "last_comment_count": 0,
-                "last_comment_ts": None,
-                "threads": {},
-            }
     if rows:
         rows.sort(key=lambda r: r["published_at"])
-        writer.write_batch(rows)
-    state["search_cursor"] = newest
+        result = writer.write_batch([dict(r) for r in rows])
+        safe = rows[: result.safe_count]
+        for r in safe:
+            if r["external_id"] not in state["videos"]:
+                state["videos"][r["external_id"]] = {
+                    "published": r["published_at"],
+                    "last_comment_count": 0,
+                    "last_comment_ts": None,
+                    "threads": {},
+                }
+        # advance the cursor only over safely-written rows, monotonically
+        if safe:
+            newest = max(r["published_at"] for r in safe)
+            if not cursor_iso or newest > cursor_iso:
+                state["search_cursor"] = newest
 
 
 # ---------------------------------------------------------------------------
@@ -297,28 +344,38 @@ def _stats_gate(video_index: dict[tuple[int, str], dict], stats) -> None:
             stats.incr("yt_stats_errors")
             continue
         by_id = {item["id"]: item.get("statistics", {}) for item in data.get("items", [])}
+        changed: dict[str, dict] = {}
         for (sid, vid), meta in video_index.items():
             st = by_id.get(vid)
             if st is None:
                 continue
-            meta["comment_count"] = int(st.get("commentCount", 0) or 0)
-            meta["view_count"] = int(st.get("viewCount", 0) or 0)
-        # refresh metrics on stored video mentions (metrics only — body untouched)
-        for vid, st in by_id.items():
-            db.client().table("mentions").update({
-                "metrics": {"views": int(st.get("viewCount", 0) or 0),
-                            "likes": int(st.get("likeCount", 0) or 0),
-                            "comments": int(st.get("commentCount", 0) or 0)}
-            }).eq("platform", "youtube").eq("external_id", vid).execute()
+            cc = int(st.get("commentCount", 0) or 0)
+            vc = int(st.get("viewCount", 0) or 0)
+            lc = int(st.get("likeCount", 0) or 0)
+            # only push a metrics UPDATE when a number actually moved (avoids
+            # one zero-effect PostgREST write per active video per cycle)
+            if cc != meta.get("comment_count") or vc != meta.get("view_count") \
+                    or lc != meta.get("like_count"):
+                changed[vid] = {"views": vc, "likes": lc, "comments": cc}
+            meta["comment_count"] = cc
+            meta["view_count"] = vc
+            meta["like_count"] = lc
+        for vid, metrics in changed.items():
+            db.client().table("mentions").update({"metrics": metrics}) \
+                .eq("platform", "youtube").eq("external_id", vid).execute()
+        stats.incr("yt_metric_updates", len(changed))
 
 
 # ---------------------------------------------------------------------------
 # 3. Comments (top-level via commentThreads, replies via comments.list)
 # ---------------------------------------------------------------------------
 
-def _fetch_comments(src_id: int, vid: str, meta: dict, writer: MentionWriter, stats) -> None:
+def _fetch_comments(src_id: int, vid: str, meta: dict, writer: MentionWriter, stats) -> bool:
+    """Returns True if the write was cap-truncated. On cap we commit NOTHING to
+    meta (last_comment_ts / threads), so the caller leaves the commentCount gate
+    open and the next cycle re-fetches; dedup absorbs the overlap."""
     last_ts = meta.get("last_comment_ts")
-    threads: dict[str, int] = meta.get("threads") or {}
+    threads: dict[str, int] = dict(meta.get("threads") or {})  # copy; commit only on success
     rows, page_token, newest_ts = [], None, last_ts
     reply_targets: list[str] = []
 
@@ -363,16 +420,23 @@ def _fetch_comments(src_id: int, vid: str, meta: dict, writer: MentionWriter, st
             if not page_token:
                 break
 
+    capped = False
     if rows:
         rows.sort(key=lambda r: r["published_at"])
-        writer.write_batch(rows)
-        stats.incr("yt_comments", len(rows))
+        result = writer.write_batch([dict(r) for r in rows])
+        capped = result.capped
+        stats.incr("yt_comments", result.inserted)
+
+    if capped:
+        return True  # commit nothing — gate stays open, next cycle re-fetches
+
     if newest_ts:
         meta["last_comment_ts"] = newest_ts
     # bound per-video thread state
     if len(threads) > MAX_TRACKED_THREADS:
         threads = dict(sorted(threads.items(), key=lambda kv: kv[1], reverse=True)[:MAX_TRACKED_THREADS])
     meta["threads"] = threads
+    return False
 
 
 def _comment_row(comment: dict, vid: str, src_id: int) -> dict:

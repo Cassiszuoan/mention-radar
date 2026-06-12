@@ -47,26 +47,32 @@ def _get(url: str, params: dict | None = None, timeout: int = 30) -> requests.Re
 def run(cfg: Config, stats) -> None:
     writer = MentionWriter(cfg, stats)
     freshest: list[float] = []  # max created_utc seen per arctic source
-    arctic_ok = True
+    sub_attempted = 0
+    sub_errored = 0
 
     for src in cfg.sources:
         if src["platform"] != "reddit":
             continue
         try:
             if src["kind"] == "subreddit":
+                sub_attempted += 1
                 seen = _ingest_subreddit(src, cfg, writer, stats)
                 if seen:
                     freshest.append(seen)
             elif src["kind"] == "search":
                 _ingest_search_rss(src, cfg, writer, stats)
         except requests.RequestException as exc:
-            arctic_ok = arctic_ok and src["kind"] != "subreddit"
+            if src["kind"] == "subreddit":
+                sub_errored += 1
             stats.incr("reddit_source_errors")
             print(f"[reddit] source {src['id']} error {type(exc).__name__}")
         if writer.remaining == 0:
             print("[reddit] daily write cap reached — stopping fetches")
             break
 
+    # Arctic is "down" only if EVERY subreddit source failed — one banned/typo'd
+    # source must not poison the freshness probe and trigger paid Apify daily.
+    arctic_ok = sub_attempted == 0 or sub_errored < sub_attempted
     _update_freshness_state(cfg, stats, freshest, arctic_ok)
 
 
@@ -89,6 +95,7 @@ def _ingest_subreddit(src: dict, cfg: Config, writer: MentionWriter, stats) -> f
         after = cursor - margin
         last_safe = cursor
         max_seen = 0.0
+        was_capped = False
 
         for _ in range(MAX_PAGES):
             resp = _get(f"{ARCTIC}/{endpoint}/search", params={
@@ -108,6 +115,7 @@ def _ingest_subreddit(src: dict, cfg: Config, writer: MentionWriter, stats) -> f
             if result.safe_count > 0:
                 last_safe = max(last_safe, ts[result.safe_count - 1])
             if result.capped:
+                was_capped = True
                 break
             after = max(ts)
             if len(items) < 100:
@@ -115,8 +123,10 @@ def _ingest_subreddit(src: dict, cfg: Config, writer: MentionWriter, stats) -> f
 
         if max_seen:
             max_seen_overall = max(max_seen_overall, max_seen)
-            # normal advance: never past now−margin; cap stop: only to last safe item
-            scfg[cursor_key] = min(last_safe if writer.remaining == 0 else max_seen,
+            # normal advance: never past now−margin; cap stop: only to last safe item.
+            # Use the authoritative capped flag, not writer.remaining (dedup/race can
+            # leave remaining>0 while a page was still cap-truncated).
+            scfg[cursor_key] = min(last_safe if was_capped else max_seen,
                                    now - margin)
         scfg[f"freshness_{kind}"] = max_seen or scfg.get(f"freshness_{kind}")
 

@@ -10,8 +10,11 @@
    - `Project URL` → `SUPABASE_URL`
    - `service_role` key → `SUPABASE_SERVICE_KEY`(**絕不可進前端/repo**)
    - `anon` key → 給儀表板用
-5. Authentication → Providers → Email:開啟 **Email OTP**;Users → 手動建立你的 email 帳號(程式登入時 `shouldCreateUser:false`)。
-6. (建議)Authentication → SMTP:接 Resend/Brevo 免費層(內建郵件 ~2 封/時且常進垃圾箱,危機當下會鎖住你)。
+5. Authentication → Providers → Email:開啟 Email(OTP)。Users → 手動建立你的 email 帳號(程式登入 `shouldCreateUser:false`,不會自動註冊)。
+6. **⚠ 必做(否則收到的信無法用)**:
+   - Authentication → **Email Templates → Magic Link**:把 body 改成包含 `{{ .Token }}`(預設模板只給 `{{ .ConfirmationURL }}` 連結,不含 6 位數字碼;前端要的是數字碼)。
+   - Authentication → **URL Configuration → Site URL** 設成你的 `*.pages.dev` 網域(讓 magic link 備援也能正確導回,而非預設 localhost)。
+7. (建議)Authentication → SMTP:接 Resend/Brevo 免費層(內建郵件 ~2 封/時且常進垃圾箱,危機當下會鎖住你)。
 
 ## 2. 🔑 YouTube Data API v3 金鑰
 1. [console.cloud.google.com](https://console.cloud.google.com) → 新專案 → 啟用 **YouTube Data API v3**。

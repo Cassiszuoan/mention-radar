@@ -37,4 +37,9 @@ jobs:
       - name: retention + compliance
         run: python -m pipeline.run retention
       - name: keepalive (prevents 60-day cron auto-disable)
+        # commit mode (not the @v2 default API mode): matches the contents:write
+        # grant, and a dummy commit counts as repo activity for ALL workflows —
+        # API mode would only keep THIS workflow alive and needs actions:write.
         uses: gautamkrishnar/keepalive-workflow@v2
+        with:
+          use_api: false

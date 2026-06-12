@@ -19,9 +19,25 @@ export const C = {
 
 const FONT = { fontFamily: "'IBM Plex Mono', monospace", color: C.dim, fontSize: 10 };
 
+// echarts keeps every init()'d instance in a module registry; without disposal
+// they survive innerHTML replacement. The dashboard re-renders every 60s, so a
+// tab left open all day would accumulate hundreds of canvases. Track live
+// instances + their observers and tear them down before each render.
+const live: { chart: echarts.ECharts; ro: ResizeObserver }[] = [];
+
+export function disposeCharts(): void {
+  for (const { chart, ro } of live) {
+    ro.disconnect();
+    chart.dispose();
+  }
+  live.length = 0;
+}
+
 export function mountChart(el: HTMLElement): echarts.ECharts {
   const chart = echarts.init(el, undefined, { renderer: "canvas" });
-  new ResizeObserver(() => chart.resize()).observe(el);
+  const ro = new ResizeObserver(() => chart.resize());
+  ro.observe(el);
+  live.push({ chart, ro });
   return chart;
 }
 

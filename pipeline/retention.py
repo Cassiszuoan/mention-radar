@@ -50,9 +50,11 @@ def run(cfg: Config, stats) -> None:
 # ---------------------------------------------------------------------------
 
 def _purge_youtube_bodies(stats) -> None:
+    # body only (per design §2). Video titles are kept as the row's only
+    # human-readable identity; comments have no title.
     cutoff = db.iso(db.now_utc() - timedelta(days=YT_BODY_DAYS))
     res = db.client().table("mentions").update(
-        {"body": None, "title": None, "body_purged_at": db.iso(db.now_utc())}
+        {"body": None, "body_purged_at": db.iso(db.now_utc())}
     ).eq("platform", "youtube").lt("published_at", cutoff) \
      .is_("body_purged_at", "null").execute()
     stats["yt_bodies_purged"] = len(res.data or [])
@@ -65,12 +67,21 @@ def _youtube_deletion_check(stats) -> None:
     if not key:
         return
     cutoff = db.iso(db.now_utc() - timedelta(days=YT_BODY_DAYS))
-    rows = (
-        db.client().table("mentions").select("id, external_id")
-        .eq("platform", "youtube").eq("kind", "comment")
-        .gte("published_at", cutoff).is_("body_purged_at", "null")
-        .limit(3000).execute().data
-    )
+    # Paginate to exhaustion: ALL <30d comments still holding a body must be
+    # checked daily to honor the 7-day deletion deadline (policy III.E.4.g).
+    rows: list[dict] = []
+    offset = 0
+    while True:
+        page = (
+            db.client().table("mentions").select("id, external_id")
+            .eq("platform", "youtube").eq("kind", "comment")
+            .gte("published_at", cutoff).is_("body_purged_at", "null")
+            .order("id").range(offset, offset + 999).execute().data
+        )
+        rows.extend(page)
+        if len(page) < 1000:
+            break
+        offset += 1000
     purged = 0
     for i in range(0, len(rows), 50):
         chunk = rows[i : i + 50]
@@ -111,10 +122,14 @@ def _archive_and_purge_reddit_bodies(stats) -> None:
     with gzip.GzipFile(fileobj=buf, mode="wb") as gz:
         for r in rows:
             gz.write((json.dumps(r, ensure_ascii=False, default=str) + "\n").encode())
-    path = f"reddit/{db.now_utc().date().isoformat()}.jsonl.gz"
+    # Unique per-run key (timestamp), NO upsert: a same-day re-run selects a
+    # disjoint batch, so a date-keyed upsert would overwrite the first archive
+    # and the bodies it covered would be unrecoverable. A name collision now
+    # raises into the safe except-and-return path instead of purging.
+    path = f"reddit/{db.now_utc().strftime('%Y-%m-%dT%H%M%S')}.jsonl.gz"
     try:
         db.client().storage.from_("archives").upload(
-            path, buf.getvalue(), {"content-type": "application/gzip", "upsert": "true"}
+            path, buf.getvalue(), {"content-type": "application/gzip"}
         )
     except Exception:  # noqa: BLE001 — archive failure must NOT purge bodies
         stats["reddit_archive_failed"] = True

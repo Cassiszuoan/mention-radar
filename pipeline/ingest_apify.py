@@ -49,6 +49,16 @@ def run_if_needed(cfg: Config, stats, stale: bool) -> None:
         return
     max_items = int(acfg.get("max_items_per_run", 500))
 
+    # Persist the run counter BEFORE the call returns: the actor is billed the
+    # moment the POST starts, so if raise_for_status() (e.g. 408 on the 300s sync
+    # endpoint) or the later write raises, the counter must already be incremented
+    # — otherwise every 20-min cycle re-bills while Arctic stays stale (~72 runs/day
+    # instead of the 1/day cost ceiling).
+    runs = state.get("apify_runs", {})
+    state["apify_runs"] = {today: runs_today + 1}  # keep only today
+    db.client().table("app_config").upsert(
+        {"key": "ingest_state", "value": state}, on_conflict="key").execute()
+
     # One run covering ALL subreddits (start fees are per run).
     actor = acfg.get("actor", "automation-lab~reddit-scraper")
     resp = requests.post(
@@ -97,11 +107,10 @@ def run_if_needed(cfg: Config, stats, stale: bool) -> None:
         rows.sort(key=lambda r: r["published_at"])
         writer.write_batch(rows)
 
-    runs = state.get("apify_runs", {})
-    runs = {today: runs_today + 1}  # keep only today (no unbounded growth)
-    state["apify_runs"] = runs
-    est = state.get("apify_month_spend_usd", {})
+    # spend estimate (re-read state to avoid clobbering the counter just written)
+    state = db.get_app_config("ingest_state", default=state)
     month = today[:7]
+    est = state.get("apify_month_spend_usd", {})
     spend = est.get(month, 0) + len(items) * 0.00115 + 0.003
     state["apify_month_spend_usd"] = {month: round(spend, 2)}
     db.client().table("app_config").upsert(

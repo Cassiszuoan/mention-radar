@@ -134,10 +134,12 @@ export async function renderEntity(
   el: HTMLElement, entity: Entity, alerts: Alert[],
   sources: { id: number; platform: string; kind: string; source_key: string }[],
   state: { range: string; platform: string; sourceId: string; order: string },
+  alive: () => boolean = () => true,
 ): Promise<void> {
   const days = { "24h": 1, "7d": 7, "30d": 30, "90d": 90 }[state.range] ?? 7;
   const since = new Date(Date.now() - days * 86400e3).toISOString();
   const agg = days <= 7 ? await api.aggHourly(since) : await api.aggDaily(since);
+  if (!alive()) return;
 
   const mine = agg.filter((r) =>
     r.entity_id === entity.id &&
@@ -159,7 +161,9 @@ export async function renderEntity(
     .filter((a) => a.entity_id === entity.id)
     .map((a) => ({
       start: a.window_start,
-      end: new Date(new Date(a.window_start).getTime() + 3600e3).toISOString(),
+      // honor the real window (volume=1h, sentiment=24h); fall back by type
+      end: a.window_end ?? new Date(new Date(a.window_start).getTime()
+        + (a.type === "sentiment_drop" ? 24 : 1) * 3600e3).toISOString(),
       high: a.severity === "high",
     }));
 
@@ -186,7 +190,8 @@ export async function renderEntity(
     </div>
     <div class="chart-lg" id="trend"></div>
     <h2 class="sect">mention 流
-      <span style="float:right">${seg("order", ["latest", "negative"], state.order)}</span></h2>
+      <span style="float:right">${seg("order", ["latest", "negative", "engaged"], state.order)}</span></h2>
+    <div id="aspects"></div>
     <div id="feed"><div class="empty">載入中…</div></div>`;
 
   if (sentiment.length || volume.length) {
@@ -198,19 +203,44 @@ export async function renderEntity(
 
   const feed = el.querySelector<HTMLElement>("#feed")!;
   const mentions = await api.mentions(
-    entity.id, since, state.order as "latest" | "negative",
+    entity.id, since, state.order as "latest" | "negative" | "engaged",
     state.platform || undefined,
     state.sourceId ? Number(state.sourceId) : undefined);
+  if (!alive()) return;
   feed.innerHTML = mentions.length
     ? mentions.map(mentionItem).join("")
     : `<div class="empty">此範圍無 mention</div>`;
+
+  // Top negative aspects (design §6): aggregate the negative-scored aspect
+  // facets across the fetched mentions.
+  const aspectAcc = new Map<string, { sum: number; n: number }>();
+  for (const m of mentions) {
+    for (const a of m.aspects ?? []) {
+      if (typeof a?.score !== "number") continue;
+      const acc = aspectAcc.get(a.name) ?? { sum: 0, n: 0 };
+      acc.sum += a.score; acc.n += 1;
+      aspectAcc.set(a.name, acc);
+    }
+  }
+  const topNeg = [...aspectAcc.entries()]
+    .map(([name, v]) => ({ name, avg: v.sum / v.n, n: v.n }))
+    .filter((a) => a.avg < 0)
+    .sort((a, b) => a.avg - b.avg)
+    .slice(0, 8);
+  const aspectsEl = el.querySelector<HTMLElement>("#aspects")!;
+  aspectsEl.innerHTML = topNeg.length
+    ? `<div class="quality">${topNeg.map((a) =>
+        `<span><b>${esc(a.name)}</b> <span class="down">${a.avg.toFixed(2)}</span> ·${a.n}</span>`
+      ).join("")}</div>`
+    : "";
 }
 
 function mentionItem(m: MentionRow): string {
-  const label = m.label ? `<span class="badge ${m.label}">${m.label} ${m.sentiment ?? ""}</span>` : "";
+  const label = m.label
+    ? `<span class="badge ${esc(m.label)}">${esc(m.label)} ${m.sentiment ?? ""}</span>` : "";
   const text = m.body_purged_at
     ? `<div class="body purged">原文已依資料保留政策清除(metadata 保留)</div>`
-    : `<div class="body">${esc((m.title ? m.title + " — " : "") + (m.body ?? "")).slice(0, 600)}</div>`;
+    : `<div class="body">${esc(((m.title ? m.title + " — " : "") + (m.body ?? "")).slice(0, 600))}</div>`;
   return `<div class="mention">
     <div class="head">
       ${label}
@@ -252,7 +282,7 @@ export function renderAlerts(el: HTMLElement, alerts: Alert[]): void {
       <tr class="evidence-row" data-for="${a.id}" style="display:none"><td colspan="8">
         ${(a.evidence?.items ?? []).map((ev) => `
           <div class="mention"><div class="head">
-            <span class="badge ${ev.label ?? "neu"}">${ev.label ?? "?"} ${ev.sentiment ?? ""}</span>
+            <span class="badge ${esc(ev.label ?? "neu")}">${esc(ev.label ?? "?")} ${ev.sentiment ?? ""}</span>
             <span>${esc(ev.platform)}</span><span>${esc(ev.published_at?.slice(0, 16))}</span>
             ${ev.url ? `<a href="${esc(ev.url)}" target="_blank" rel="noreferrer">原文 ↗</a>` : ""}
           </div><div class="body">${esc(ev.summary ?? "")}</div></div>`).join("")
@@ -270,8 +300,14 @@ export function renderAlerts(el: HTMLElement, alerts: Alert[]): void {
         row.style.display = row.style.display === "none" ? "" : "none";
         return;
       }
-      await api.ackAlert(id, act as "ack" | "resolved");
-      dispatchEvent(new CustomEvent("refresh"));
+      try {
+        const rows = await api.ackAlert(id, act as "ack" | "resolved");
+        if (!rows.length) throw new Error("沒有更新任何列(權限?)");
+        dispatchEvent(new CustomEvent("refresh"));
+      } catch (err) {
+        btn.textContent = "失敗";
+        btn.title = (err as { message?: string })?.message ?? "未知錯誤";
+      }
     });
   });
 }
@@ -280,8 +316,9 @@ export function renderAlerts(el: HTMLElement, alerts: Alert[]): void {
 // Reports
 // ---------------------------------------------------------------------------
 
-export async function renderReports(el: HTMLElement): Promise<void> {
+export async function renderReports(el: HTMLElement, alive: () => boolean = () => true): Promise<void> {
   const reports = await api.reports();
+  if (!alive()) return;
   if (!reports.length) {
     el.innerHTML = `<div class="empty">尚無報告(每週一 09:07 自動產出)</div>`;
     return;

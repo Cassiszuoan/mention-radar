@@ -99,15 +99,33 @@ def run(cfg: Config, stats, model_override: str | None = None,
 
     for i in range(0, len(pending), batch_size):
         batch = pending[i : i + batch_size]
-        try:
-            limiter.wait()
-            results = _analyze_batch(batch, cfg, model, gcfg)
-        except Exception:  # noqa: BLE001 — one bad batch must not kill the cycle
+        results = _analyze_with_retry(batch, cfg, model, gcfg, limiter, stats)
+        if results is None:
+            # exhausted retries: mark failed (terminal on the fallback pass)
             stats.incr("batches_failed")
-            _mark_failed(batch)
+            _mark_failed(batch, terminal=only_failed)
             continue
         _persist(batch, results, model, stats)
     stats["model"] = model
+
+
+def _analyze_with_retry(batch, cfg, model, gcfg, limiter, stats) -> dict | None:
+    """Design §4: client-side rate limit + up to 3 attempts before marking
+    failed. Retries transient 429/5xx/timeout with backoff; fails fast on 4xx
+    (e.g. a 400 schema error won't fix itself)."""
+    for attempt in range(3):
+        try:
+            limiter.wait()
+            return _analyze_batch(batch, cfg, model, gcfg)
+        except requests.HTTPError as exc:
+            code = exc.response.status_code if exc.response is not None else 0
+            if code not in (429, 500, 502, 503, 504):
+                return None  # non-retryable
+        except (requests.RequestException, ValueError, KeyError):
+            pass  # network / JSON / shape — retryable
+        if attempt < 2:
+            time.sleep(min(10 * (2 ** attempt), 45))
+    return None
 
 
 def _fetch_pending(cfg: Config, only_failed: bool, limit: int = 600) -> list[dict]:
@@ -115,25 +133,33 @@ def _fetch_pending(cfg: Config, only_failed: bool, limit: int = 600) -> list[dic
         db.client()
         .table("mention_entities")
         .select("mention_id, entity_id, "
-                "mentions(title, body, platform, published_at), entities(name, slug)")
+                "mentions!inner(title, body, platform, published_at), entities(name, slug)")
+        .order("mention_id", desc=True)
         .limit(limit)
     )
     if only_failed:
-        # daily retry pass: previously-failed rows, fallback model, one shot
-        q = q.eq("model", "failed").is_("analyzed_at", "null")
+        # daily retry pass: previously-failed rows, fallback model, ONE shot.
+        # Age-filter server-side (mentions!inner + gte) and order newest-first so
+        # >7d-old stale failures can't starve the unordered limit-600 window.
+        cutoff = db.iso(db.now_utc() - timedelta(days=7))
+        q = q.eq("model", "failed").is_("analyzed_at", "null") \
+             .gte("mentions.published_at", cutoff)
     else:
-        # never re-pull failed rows here (that would retry every 20 minutes)
+        # never re-pull failed/terminal rows here (would retry every 20 minutes)
         q = q.is_("analyzed_at", "null").is_("model", "null")
     rows = q.execute().data
-    cutoff = db.iso(db.now_utc() - timedelta(days=7))
     out = []
     for r in rows:
         m = r.get("mentions") or {}
-        if only_failed and (m.get("published_at") or "") < cutoff:
-            continue  # too old to retry; will be skipped permanently
         e = r.get("entities") or {}
         text = f"{m.get('title') or ''}\n{m.get('body') or ''}".strip()
         if not text:
+            # empty (e.g. body purged before analysis): mark terminal so it stops
+            # matching the pending query forever instead of eroding fetch capacity
+            db.client().table("mention_entities").update(
+                {"relevant": False, "model": "empty", "analyzed_at": db.iso(db.now_utc())}
+            ).eq("mention_id", r["mention_id"]).eq("entity_id", r["entity_id"]) \
+             .is_("analyzed_at", "null").execute()
             continue
         out.append({
             "mention_id": r["mention_id"],
@@ -149,14 +175,19 @@ def _analyze_batch(batch: list[dict], cfg: Config, model: str, gcfg: dict) -> di
     for i, item in enumerate(batch):
         lines.append(f'--- item {i} | target product: "{item["target"]}" ---')
         lines.append(item["text"])
+    gen_cfg = {
+        "responseMimeType": "application/json",
+        "responseSchema": RESPONSE_SCHEMA,
+        "maxOutputTokens": int(gcfg.get("max_output_tokens", 4096)),
+    }
+    # thinkingBudget is a 2.5-era knob; Gemini 3.x replaced it with thinkingLevel
+    # and 400s on thinkingBudget. Only attach it for models known to accept it,
+    # so the fallback model (3.x) doesn't fail every batch.
+    if model.startswith("gemini-2.5"):
+        gen_cfg["thinkingConfig"] = {"thinkingBudget": 0}
     payload = {
         "contents": [{"parts": [{"text": "\n".join(lines)}]}],
-        "generationConfig": {
-            "responseMimeType": "application/json",
-            "responseSchema": RESPONSE_SCHEMA,
-            "maxOutputTokens": int(gcfg.get("max_output_tokens", 4096)),
-            "thinkingConfig": {"thinkingBudget": 0},
-        },
+        "generationConfig": gen_cfg,
     }
     resp = requests.post(
         f"{GEMINI}/{model}:generateContent",
@@ -203,8 +234,13 @@ def _persist(batch: list[dict], results: dict[int, dict], model: str, stats) -> 
             stats.incr("irrelevant")
 
 
-def _mark_failed(batch: list[dict]) -> None:
+def _mark_failed(batch: list[dict], terminal: bool = False) -> None:
+    # terminal=True (fallback pass exhausted): set analyzed_at + model='failed_final'
+    # so the row leaves the candidate set permanently. relevant stays null →
+    # fn_recompute_agg excludes it from analyzed_n, so aggregates aren't polluted.
+    upd = ({"model": "failed_final", "analyzed_at": db.iso(db.now_utc())}
+           if terminal else {"model": "failed"})
     for item in batch:
-        db.client().table("mention_entities").update({"model": "failed"}) \
+        db.client().table("mention_entities").update(upd) \
             .eq("mention_id", item["mention_id"]).eq("entity_id", item["entity_id"]) \
             .is_("analyzed_at", "null").execute()
