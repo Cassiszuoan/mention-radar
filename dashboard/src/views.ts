@@ -18,6 +18,26 @@ const fmtDelta = (d: number | null, suffix = "") => {
 const sentColor = (v: number | null) =>
   v == null ? "var(--dim)" : v < -0.2 ? "var(--coral)" : v > 0.2 ? "var(--green)" : "var(--ink)";
 
+// CSV export (pure frontend Blob download; UTF-8 BOM so Excel reads CJK).
+function toCsv(headers: string[], rows: (string | number | null | undefined)[][]): string {
+  const cell = (v: string | number | null | undefined) => {
+    const s = String(v ?? "");
+    return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  return [headers, ...rows].map((r) => r.map(cell).join(",")).join("\r\n");
+}
+function downloadCsv(filename: string, csv: string): void {
+  const blob = new Blob(["﻿" + csv], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+function stamp(): string {
+  return new Date().toISOString().slice(0, 16).replace(/[:T]/g, "");
+}
+
 // ---------------------------------------------------------------------------
 // shared: per-entity rollups from agg rows
 // ---------------------------------------------------------------------------
@@ -85,8 +105,9 @@ export function renderOverview(
 
   el.innerHTML = `
     <div class="banner">${alerts.filter((a) => a.status === "open").map(alertStrip).join("")}</div>
-    <h2 class="sect">我方 <em>ours</em></h2>
-    <div class="cards">${ours.map(card).join("") || `<div class="empty">尚無實體 — 至 Supabase Studio 新增</div>`}</div>
+    <h2 class="sect">我方 <em>ours</em>
+      <button id="cmp-csv" style="float:right;font-weight:500">⤓ 匯出對比 CSV</button></h2>
+    <div class="cards">${ours.map(card).join("") || `<div class="empty">尚無實體 — 至「管理」分頁新增</div>`}</div>
     <h2 class="sect">競品 <em>competitors</em></h2>
     <div class="cards">${comp.map(card).join("") || `<div class="empty">尚無競品實體</div>`}</div>
     <h2 class="sect">資料品質 <em>pipeline</em></h2>
@@ -100,6 +121,19 @@ export function renderOverview(
     const sparkEl = c.querySelector<HTMLElement>(".spark")!;
     if (s.spark.length > 1) mountChart(sparkEl).setOption(sparkOption(s.spark));
     c.addEventListener("click", () => { location.hash = `#/entity/${slug}`; });
+  });
+
+  el.querySelector<HTMLButtonElement>("#cmp-csv")?.addEventListener("click", () => {
+    const csv = toCsv(
+      ["side", "entity", "slug", "flag", "sent_24h", "vol_24h", "vol_prev_24h", "delta"],
+      entities.map((e) => {
+        const s = rollup(agg, e.id, now);
+        return [
+          e.side, e.name, e.slug, flagFor(e.id) ?? "",
+          s.sent24 ?? "", s.vol24, s.vol24Prev, s.vol24 - s.vol24Prev,
+        ];
+      }));
+    downloadCsv(`compare-${stamp()}.csv`, csv);
   });
 }
 
@@ -348,8 +382,10 @@ function val(root: ParentNode, sel: string): string {
 }
 
 export async function renderManage(el: HTMLElement, alive: () => boolean = () => true): Promise<void> {
-  const [ents, kws, srcs] = await Promise.all([
-    api.manageEntities(), api.manageKeywords(), api.manageSources(),
+  const now = new Date();
+  const since8 = new Date(now.getTime() - 8 * 86400e3).toISOString();
+  const [ents, kws, srcs, agg] = await Promise.all([
+    api.manageEntities(), api.manageKeywords(), api.manageSources(), api.aggHourly(since8),
   ]);
   if (!alive()) return;
   const kwBy = new Map<number, Keyword[]>();
@@ -380,9 +416,18 @@ export async function renderManage(el: HTMLElement, alive: () => boolean = () =>
         <span class="kw add">
           <input data-f="kw" placeholder="新關鍵字"/>
           <select data-f="mt"><option value="phrase">phrase</option><option value="word">word</option><option value="regex">regex</option></select>
+          <button data-act="kw-preview">預覽</button>
+          <i class="kw-prev" style="font-style:normal;color:var(--dim)"></i>
           <button data-act="kw-add">＋ 加字</button>
         </span>
       </div>
+      <div class="estats">${(() => {
+        const s = rollup(agg, e.id, now);
+        const vol7 = agg.filter((r) => r.entity_id === e.id).reduce((a, r) => a + r.mention_n, 0);
+        return `<span>24h 聲量 <b>${s.vol24}</b></span>
+          <span>24h 情緒 <b style="color:${sentColor(s.sent24)}">${s.sent24 ?? "—"}</b></span>
+          <span>7d 聲量 <b>${vol7}</b></span>`;
+      })()}</div>
     </div>`;
   };
 
@@ -432,7 +477,7 @@ async function mutate(btn: HTMLButtonElement, fn: () => Promise<{ id: number }[]
 
 function wireManage(el: HTMLElement): void {
   el.querySelectorAll<HTMLButtonElement>("button[data-act]").forEach((btn) => {
-    btn.addEventListener("click", () => {
+    btn.addEventListener("click", async () => {
       const act = btn.dataset.act!;
       if (act === "ent-add") {
         const slug = val(el, "#ne-slug"), name = val(el, "#ne-name");
@@ -463,6 +508,24 @@ function wireManage(el: HTMLElement): void {
       if (act === "ent-del" && mrow) {
         if (!confirm("確定刪除此產品?其關鍵字與留言關聯會一併移除。")) return;
         void mutate(btn, () => api.delEntity(Number(mrow.dataset.ent)));
+        return;
+      }
+      if (act === "kw-preview" && mrow) {
+        const box = btn.closest<HTMLElement>(".kw.add")!;
+        const keyword = val(box, "[data-f=kw]");
+        const match_type = (box.querySelector("[data-f=mt]") as HTMLSelectElement).value;
+        const out = box.querySelector<HTMLElement>(".kw-prev")!;
+        if (!keyword) { out.textContent = "請先填關鍵字"; return; }
+        const orig = btn.textContent; btn.disabled = true; btn.textContent = "…";
+        try {
+          const n = await api.previewKeyword({ keyword, matchType: match_type, entityId: Number(mrow.dataset.ent) });
+          const approx = match_type === "phrase" ? "" : "(substring 近似,上限)";
+          out.textContent = `≈ ${n} 則已收集留言命中 ${approx}`;
+        } catch (err) {
+          out.textContent = "預覽失敗:" + ((err as { message?: string })?.message ?? "未知");
+        } finally {
+          btn.disabled = false; btn.textContent = orig ?? "預覽";
+        }
         return;
       }
       if (act === "kw-add" && mrow) {
@@ -519,41 +582,148 @@ export async function renderSearch(
       <select id="f-range">${([["7d", "近 7 天"], ["30d", "近 30 天"], ["90d", "近 90 天"], ["all", "全部"]] as [string, string][])
         .map(([v, l]) => opt(v, l, state.range)).join("")}</select>
       <button class="primary" id="go">搜尋</button>
+      <button id="clear">清除</button>
     </div>
     <div id="results"><div class="empty">設定條件後按搜尋</div></div>`;
 
   const results = el.querySelector<HTMLElement>("#results")!;
   const nameById = new Map(ents.map((e) => [e.id, e.name]));
-  const run = async () => {
-    state.text = val(el, "#q");
-    state.entityId = (el.querySelector("#f-ent") as HTMLSelectElement).value;
-    state.platform = (el.querySelector("#f-plat") as HTMLSelectElement).value;
-    state.label = (el.querySelector("#f-label") as HTMLSelectElement).value;
-    state.range = (el.querySelector("#f-range") as HTMLSelectElement).value;
+  const PAGE = 100;
+  let all: MentionRow[] = [];
+  let offset = 0;
+  let lastPageFull = false;
+
+  const promoteBar = () => `<div class="dactions">
+      <span class="label">加入監測</span>
+      <input id="pm-name" value="${esc(state.text)}" title="關鍵字 / 新標的名稱" style="width:160px"/>
+      <select id="pm-ent">
+        <option value="">＋ 新標的</option>
+        ${ents.map((e) => `<option value="${e.id}">${esc(e.name)}</option>`).join("")}
+      </select>
+      <select id="pm-side"><option value="competitor">競品</option><option value="ours">我方</option></select>
+      <button id="pm-go">＋ 監測此詞</button>
+      <span style="flex:1"></span>
+      <label class="chk"><input type="checkbox" id="pm-dedupe" checked/> 去除跨標的重複</label>
+      <span id="smsg" class="hint" style="margin:0"></span>
+    </div>`;
+
+  const view = (rows: MentionRow[], dedupe: boolean): MentionRow[] => {
+    if (!dedupe) return rows;
+    const seen = new Set<number>();
+    const out: MentionRow[] = [];
+    for (const m of rows) {
+      if (seen.has(m.mention_id)) continue;
+      seen.add(m.mention_id); out.push(m);
+    }
+    return out;
+  };
+
+  const paint = () => {
+    const dedupe = (el.querySelector("#pm-dedupe") as HTMLInputElement | null)?.checked ?? true;
+    const shown = view(all, dedupe);
+    const dupNote = dedupe && shown.length < all.length
+      ? ` · 已併 ${all.length - shown.length} 筆跨標的重複` : "";
+    const more = lastPageFull
+      ? `<div class="addbar" style="justify-content:center"><button id="more">載入更多(下一頁 ${PAGE})</button></div>`
+      : "";
+    const list = el.querySelector<HTMLElement>("#rlist")!;
+    list.innerHTML = shown.length
+      ? `<div class="hint">${shown.length} 則(已載入 ${all.length},每頁 ${PAGE},依時間新→舊)${dupNote}
+          <button id="scsv-go" style="margin-left:10px">⤓ 匯出 CSV</button></div>` +
+        shown.map((m) => searchItem(m, nameById.get(m.entity_id) ?? m.name ?? "")).join("") + more
+      : `<div class="empty">查無符合條件的留言</div>`;
+    list.querySelector<HTMLButtonElement>("#more")?.addEventListener("click", () => loadPage(false));
+    list.querySelector<HTMLButtonElement>("#scsv-go")?.addEventListener("click", () => {
+      const csv = toCsv(
+        ["entity", "platform", "kind", "label", "sentiment", "published_at", "url", "title", "body"],
+        shown.map((m) => [
+          nameById.get(m.entity_id) ?? m.name ?? "", m.platform, m.kind,
+          m.label ?? "", m.sentiment ?? "",
+          m.published_at?.slice(0, 16).replace("T", " ") ?? "", m.url ?? "",
+          m.title ?? "", m.body_purged_at ? "(原文已清除)" : (m.body ?? ""),
+        ]));
+      downloadCsv(`mentions-${stamp()}.csv`, csv);
+    });
+  };
+
+  const buildFilters = (): SearchFilters => {
     const days = ({ "7d": 7, "30d": 30, "90d": 90 } as Record<string, number>)[state.range];
-    const f: SearchFilters = {
+    return {
       text: state.text || undefined,
       entityId: state.entityId ? Number(state.entityId) : undefined,
       platform: state.platform || undefined,
       label: state.label || undefined,
       sinceIso: days ? new Date(Date.now() - days * 86400e3).toISOString() : undefined,
+      limit: PAGE,
     };
-    results.innerHTML = `<div class="loading">搜尋中…</div>`;
+  };
+
+  const loadPage = async (fresh: boolean) => {
+    if (fresh) {
+      state.text = val(el, "#q");
+      state.entityId = (el.querySelector("#f-ent") as HTMLSelectElement).value;
+      state.platform = (el.querySelector("#f-plat") as HTMLSelectElement).value;
+      state.label = (el.querySelector("#f-label") as HTMLSelectElement).value;
+      state.range = (el.querySelector("#f-range") as HTMLSelectElement).value;
+      all = []; offset = 0;
+      results.innerHTML = promoteBar() + `<div id="rlist"><div class="loading">搜尋中…</div></div>`;
+      wirePromote();
+    } else {
+      const btn = el.querySelector<HTMLButtonElement>("#more");
+      if (btn) { btn.disabled = true; btn.textContent = "載入中…"; }
+    }
     try {
-      const rows = await api.searchMentions(f);
-      results.innerHTML = rows.length
-        ? `<div class="hint">${rows.length} 則(上限 100,依時間新→舊)</div>` +
-          rows.map((m) => searchItem(m, nameById.get(m.entity_id) ?? m.name ?? "")).join("")
-        : `<div class="empty">查無符合條件的留言</div>`;
+      const rows = await api.searchMentions({ ...buildFilters(), offset });
+      if (!alive()) return;
+      lastPageFull = rows.length === PAGE;
+      offset += rows.length;
+      all = all.concat(rows);
+      paint();
     } catch (err) {
-      results.innerHTML = `<div class="empty">搜尋失敗(${esc((err as { message?: string })?.message ?? "未知")})</div>`;
+      el.querySelector<HTMLElement>("#rlist")!.innerHTML =
+        `<div class="empty">搜尋失敗(${esc((err as { message?: string })?.message ?? "未知")})</div>`;
     }
   };
-  el.querySelector<HTMLButtonElement>("#go")!.addEventListener("click", run);
+
+  function wirePromote(): void {
+    const msg = el.querySelector<HTMLElement>("#smsg")!;
+    el.querySelector<HTMLButtonElement>("#pm-go")!.addEventListener("click", async (ev) => {
+      const btn = ev.currentTarget as HTMLButtonElement;
+      const name = (el.querySelector("#pm-name") as HTMLInputElement).value.trim();
+      const existingId = (el.querySelector("#pm-ent") as HTMLSelectElement).value;
+      const side = (el.querySelector("#pm-side") as HTMLSelectElement).value;
+      if (!name) { msg.textContent = "請填關鍵字 / 名稱"; return; }
+      btn.disabled = true; msg.textContent = "加入中…";
+      try {
+        const res = await promoteToMonitoring({
+          name, side, existingId: existingId ? Number(existingId) : undefined,
+        });
+        const tgt = existingId ? (nameById.get(Number(existingId)) ?? "標的") : name;
+        msg.textContent = `✓ 已將「${name}」加為${res.reused ? "" : "新"}標的「${tgt}」關鍵字,下輪 cron(≤20分)開始收集`;
+        dispatchEvent(new CustomEvent("refresh"));
+      } catch (err) {
+        msg.textContent = "失敗:" + ((err as { message?: string })?.message ?? "未知(RLS 未套用?)");
+      } finally {
+        btn.disabled = false;
+      }
+    });
+    el.querySelector<HTMLInputElement>("#pm-dedupe")!.addEventListener("change", paint);
+  }
+
+  el.querySelector<HTMLButtonElement>("#go")!.addEventListener("click", () => loadPage(true));
   el.querySelector<HTMLInputElement>("#q")!.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") run();
+    if (e.key === "Enter") loadPage(true);
   });
-  if (state.text || state.entityId || state.platform || state.label) run();
+  el.querySelector<HTMLButtonElement>("#clear")!.addEventListener("click", () => {
+    state.text = ""; state.entityId = ""; state.platform = ""; state.label = ""; state.range = "7d";
+    (el.querySelector("#q") as HTMLInputElement).value = "";
+    (el.querySelector("#f-ent") as HTMLSelectElement).value = "";
+    (el.querySelector("#f-plat") as HTMLSelectElement).value = "";
+    (el.querySelector("#f-label") as HTMLSelectElement).value = "";
+    (el.querySelector("#f-range") as HTMLSelectElement).value = "7d";
+    results.innerHTML = `<div class="empty">設定條件後按搜尋</div>`;
+  });
+  if (state.text || state.entityId || state.platform || state.label) loadPage(true);
 }
 
 function searchItem(m: MentionRow, entName: string): string {
@@ -618,6 +788,7 @@ export async function renderDiscover(
         <button id="pm-go">＋ 監測此主題</button>
         <span style="flex:1"></span>
         <button id="snt-go">⚡ 跑情緒分析</button>
+        <button id="dcsv-go">⤓ 匯出 CSV</button>
         <span id="dmsg" class="hint" style="margin:0"></span>
       </div>`;
       const rBlock = r.reddit?.length
@@ -628,6 +799,18 @@ export async function renderDiscover(
           + r.youtube.map((m, i) => discoverItem(m, (r.reddit?.length ?? 0) + i)).join("") : "";
       results.innerHTML = notes + actions + rBlock + yBlock;
       wireDiscoverActions(el, state, items);
+      el.querySelector<HTMLButtonElement>("#dcsv-go")!.addEventListener("click", () => {
+        const csv = toCsv(
+          ["platform", "kind", "source", "created", "score", "url", "title", "body"],
+          items.map((m) => {
+            const when = typeof m.created === "number"
+              ? new Date(m.created * 1000).toISOString().slice(0, 16).replace("T", " ")
+              : (typeof m.created === "string" ? m.created.slice(0, 16).replace("T", " ") : "");
+            const src = m.platform === "reddit" ? `r/${m.subreddit ?? ""}` : (m.channel ?? "");
+            return [m.platform, m.kind, src, when, m.score ?? "", m.url, m.title ?? "", m.body ?? ""];
+          }));
+        downloadCsv(`discover-${dslug(state.q) || "q"}-${stamp()}.csv`, csv);
+      });
     } catch (err) {
       results.innerHTML = `<div class="empty">探索失敗(${esc((err as { message?: string })?.message ?? "未知")})</div>`;
     }
@@ -656,6 +839,47 @@ function discoverItem(m: DiscoverItem, idx: number): string {
 const dslug = (s: string) =>
   s.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60);
 
+// Shared promote-to-monitoring path used by both 搜尋 and 探索: resolve the
+// target entity (existing pick, or create-or-reuse by slug), add the keyword,
+// and ensure any reddit subreddit sources. Throws on RLS / hard failure.
+type PromoteInput = {
+  name: string; side: string; existingId?: number;
+  keyword?: string; matchType?: string; subreddits?: string;
+};
+type PromoteResult = { entId: number; reused: boolean; sourcesAdded: number };
+
+async function promoteToMonitoring(p: PromoteInput): Promise<PromoteResult> {
+  const keyword = (p.keyword ?? p.name).trim();
+  const matchType = p.matchType ?? "phrase";
+  let entId: number | undefined;
+  let reused = false;
+  if (p.existingId) {
+    entId = p.existingId;
+    reused = true;
+    await api.addKeywordToExisting(entId, keyword, matchType);
+  } else {
+    const slug = dslug(p.name) || ("ent-" + Date.now());
+    try {
+      const created = await api.addEntity({ slug, name: p.name, side: p.side });
+      entId = created[0]?.id;
+    } catch {
+      const ex = await api.entityBySlug(slug);
+      entId = ex[0]?.id;
+      reused = true;
+    }
+    if (!entId) throw new Error("無法建立/找到標的(RLS 已套用?)");
+    await api.addKeyword({ entity_id: entId, keyword, match_type: matchType });
+  }
+  const subs = (p.subreddits ?? "").split(",")
+    .map((s) => s.trim().replace(/^r\//i, "")).filter(Boolean);
+  let sourcesAdded = 0;
+  for (const sub of subs) {
+    try { await api.ensureSource({ platform: "reddit", kind: "subreddit", source_key: sub }); sourcesAdded++; }
+    catch { /* dup/err — best-effort */ }
+  }
+  return { entId, reused, sourcesAdded };
+}
+
 function wireDiscoverActions(el: HTMLElement, state: DiscoverState, items: DiscoverItem[]): void {
   const msg = el.querySelector<HTMLElement>("#dmsg")!;
 
@@ -664,25 +888,10 @@ function wireDiscoverActions(el: HTMLElement, state: DiscoverState, items: Disco
     const name = (el.querySelector("#pm-name") as HTMLInputElement).value.trim();
     const side = (el.querySelector("#pm-side") as HTMLSelectElement).value;
     if (!name) { msg.textContent = "請填名稱"; return; }
-    const slug = dslug(name) || ("ent-" + Date.now());
     btn.disabled = true; msg.textContent = "加入中…";
     try {
-      let entId: number | undefined;
-      try {
-        const created = await api.addEntity({ slug, name, side });
-        entId = created[0]?.id;
-      } catch {
-        const ex = await api.entityBySlug(slug);  // already exists → reuse
-        entId = ex[0]?.id;
-      }
-      if (!entId) throw new Error("無法建立/找到標的(RLS 已套用?)");
-      await api.addKeyword({ entity_id: entId, keyword: name, match_type: "phrase" });
-      const subs = state.subreddits.split(",").map((s) => s.trim().replace(/^r\//i, "")).filter(Boolean);
-      let added = 0;
-      for (const sub of subs) {
-        try { await api.ensureSource({ platform: "reddit", kind: "subreddit", source_key: sub }); added++; } catch { /* dup/err */ }
-      }
-      msg.textContent = `✓ 已監測「${name}」+ 確保 ${added} 來源,下輪 cron(≤20分)開始收集`;
+      const res = await promoteToMonitoring({ name, side, subreddits: state.subreddits });
+      msg.textContent = `✓ 已監測「${name}」+ 確保 ${res.sourcesAdded} 來源,下輪 cron(≤20分)開始收集`;
     } catch (err) {
       msg.textContent = "失敗:" + ((err as { message?: string })?.message ?? "未知(RLS 未套用?)");
     } finally {

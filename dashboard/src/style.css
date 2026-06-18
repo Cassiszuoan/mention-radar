@@ -183,6 +183,10 @@ button.danger:hover { border-color: var(--coral); }
 .kw.add { background: transparent; border-style: dashed; }
 .kw.add input { width: 110px; padding: 5px 8px; }
 .hint { font: 400 11px var(--mono); color: var(--dim); margin: 14px 0 0; }
+.estats { display: flex; gap: 18px; margin-top: 10px; padding-top: 10px;
+  border-top: 1px solid var(--line); font: 400 11px var(--mono); color: var(--dim); }
+.estats b { color: var(--ink); font-weight: 600; }
+.kw .kw-prev { font: 500 10px var(--mono); margin: 0 4px; }
 .dactions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
   background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
   padding: 10px 12px; margin: 6px 0 16px; }

@@ -55,6 +55,7 @@ export type SourceFull = {
 };
 export type SearchFilters = {
   text?: string; entityId?: number; platform?: string; label?: string; sinceIso?: string;
+  limit?: number; offset?: number;
 };
 export type DiscoverItem = {
   platform: string; kind: string; subreddit?: string; channel?: string;
@@ -151,6 +152,9 @@ export const api = {
 
   addKeyword: (k: { entity_id: number; keyword: string; match_type: string }) =>
     withRetry<{ id: number }[]>(() => sb.from("keywords").insert(k).select("id") as never),
+  addKeywordToExisting: (entity_id: number, keyword: string, match_type = "phrase") =>
+    withRetry<{ id: number }[]>(() =>
+      sb.from("keywords").insert({ entity_id, keyword, match_type }).select("id") as never),
   delKeyword: (id: number) =>
     withRetry<{ id: number }[]>(() =>
       sb.from("keywords").delete().eq("id", id).select("id") as never),
@@ -177,8 +181,29 @@ export const api = {
       if (f.platform) q = q.eq("platform", f.platform);
       if (f.label) q = q.eq("label", f.label);
       if (f.sinceIso) q = q.gte("published_at", f.sinceIso);
-      return q.order("published_at", { ascending: false }).limit(100) as never;
+      const limit = f.limit ?? 100;
+      const offset = f.offset ?? 0;
+      return q.order("published_at", { ascending: false })
+        .range(offset, offset + limit - 1) as never;
     }),
+
+  // Preview how many already-collected mentions a candidate keyword would match,
+  // so the operator can tune before saving. phrase = substring (exact); word/regex
+  // approximated by substring (upper bound). Bypasses withRetry to read `count`.
+  previewKeyword: async (p: { keyword: string; matchType: string; entityId?: number }): Promise<number> => {
+    const t = (p.keyword ?? "").replace(/[,%()"'\\*]/g, " ").trim();
+    if (!t) return 0;
+    const build = () => {
+      let q = sb.from("v_mentions").select("*", { count: "exact", head: true })
+        .or(`title.ilike.*${t}*,body.ilike.*${t}*`);
+      if (p.entityId) q = q.eq("entity_id", p.entityId);
+      return q;
+    };
+    let res = await build();
+    if (res.error) { await sb.auth.refreshSession(); res = await build(); }
+    if (res.error) throw res.error;
+    return res.count ?? 0;
+  },
 
   // Live ad-hoc discovery via the Worker /api/discover (server holds the keys).
   discover: async (p: { q: string; platform: string; subreddits: string; limit?: number }) => {
