@@ -608,11 +608,26 @@ export async function renderDiscover(
     results.innerHTML = `<div class="empty">即時搜尋中…(可能要幾秒)</div>`;
     try {
       const r = await api.discover({ q: state.q, platform: state.platform, subreddits: state.subreddits, limit: 10 });
-      const blocks: string[] = [];
-      if (r.notes?.length) blocks.push(`<div class="hint">${r.notes.map(esc).join(" · ")}</div>`);
-      if (r.reddit?.length) blocks.push(`<h2 class="sect">Reddit <em>${r.reddit.length}</em></h2>` + r.reddit.map(discoverItem).join(""));
-      if (r.youtube?.length) blocks.push(`<h2 class="sect">YouTube <em>${r.youtube.length}</em></h2>` + r.youtube.map(discoverItem).join(""));
-      results.innerHTML = blocks.length ? blocks.join("") : `<div class="empty">查無即時結果</div>`;
+      const items = [...(r.reddit ?? []), ...(r.youtube ?? [])];
+      const notes = r.notes?.length ? `<div class="hint">${r.notes.map(esc).join(" · ")}</div>` : "";
+      if (!items.length) { results.innerHTML = notes + `<div class="empty">查無即時結果</div>`; return; }
+      const actions = `<div class="dactions">
+        <span class="label">加入監測</span>
+        <input id="pm-name" value="${esc(state.q)}" title="監測標的名稱" style="width:150px"/>
+        <select id="pm-side"><option value="competitor">競品</option><option value="ours">我方</option></select>
+        <button id="pm-go">＋ 監測此主題</button>
+        <span style="flex:1"></span>
+        <button id="snt-go">⚡ 跑情緒分析</button>
+        <span id="dmsg" class="hint" style="margin:0"></span>
+      </div>`;
+      const rBlock = r.reddit?.length
+        ? `<h2 class="sect">Reddit <em>${r.reddit.length}</em></h2>`
+          + r.reddit.map((m, i) => discoverItem(m, i)).join("") : "";
+      const yBlock = r.youtube?.length
+        ? `<h2 class="sect">YouTube <em>${r.youtube.length}</em></h2>`
+          + r.youtube.map((m, i) => discoverItem(m, (r.reddit?.length ?? 0) + i)).join("") : "";
+      results.innerHTML = notes + actions + rBlock + yBlock;
+      wireDiscoverActions(el, state, items);
     } catch (err) {
       results.innerHTML = `<div class="empty">探索失敗(${esc((err as { message?: string })?.message ?? "未知")})</div>`;
     }
@@ -622,7 +637,7 @@ export async function renderDiscover(
   if (state.q) run();
 }
 
-function discoverItem(m: DiscoverItem): string {
+function discoverItem(m: DiscoverItem, idx: number): string {
   const when = typeof m.created === "number"
     ? new Date(m.created * 1000).toISOString().slice(0, 16).replace("T", " ")
     : (typeof m.created === "string" ? m.created.slice(0, 16).replace("T", " ") : "");
@@ -630,9 +645,71 @@ function discoverItem(m: DiscoverItem): string {
   const body = ((m.title ? m.title + " — " : "") + (m.body ?? "")).slice(0, 500);
   return `<div class="mention">
     <div class="head">
+      <span class="badge sent" data-sent-idx="${idx}" style="display:none"></span>
       <span class="badge neu">${esc(m.platform)}·${esc(m.kind)}</span>
       <span>${src}</span>
       <span>${esc(when)}</span>
       ${m.url ? `<a href="${esc(m.url)}" target="_blank" rel="noreferrer">原文 ↗</a>` : ""}
     </div><div class="body">${esc(body)}</div></div>`;
+}
+
+const dslug = (s: string) =>
+  s.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60);
+
+function wireDiscoverActions(el: HTMLElement, state: DiscoverState, items: DiscoverItem[]): void {
+  const msg = el.querySelector<HTMLElement>("#dmsg")!;
+
+  el.querySelector<HTMLButtonElement>("#pm-go")!.addEventListener("click", async (ev) => {
+    const btn = ev.currentTarget as HTMLButtonElement;
+    const name = (el.querySelector("#pm-name") as HTMLInputElement).value.trim();
+    const side = (el.querySelector("#pm-side") as HTMLSelectElement).value;
+    if (!name) { msg.textContent = "請填名稱"; return; }
+    const slug = dslug(name) || ("ent-" + Date.now());
+    btn.disabled = true; msg.textContent = "加入中…";
+    try {
+      let entId: number | undefined;
+      try {
+        const created = await api.addEntity({ slug, name, side });
+        entId = created[0]?.id;
+      } catch {
+        const ex = await api.entityBySlug(slug);  // already exists → reuse
+        entId = ex[0]?.id;
+      }
+      if (!entId) throw new Error("無法建立/找到標的(RLS 已套用?)");
+      await api.addKeyword({ entity_id: entId, keyword: name, match_type: "phrase" });
+      const subs = state.subreddits.split(",").map((s) => s.trim().replace(/^r\//i, "")).filter(Boolean);
+      let added = 0;
+      for (const sub of subs) {
+        try { await api.ensureSource({ platform: "reddit", kind: "subreddit", source_key: sub }); added++; } catch { /* dup/err */ }
+      }
+      msg.textContent = `✓ 已監測「${name}」+ 確保 ${added} 來源,下輪 cron(≤20分)開始收集`;
+    } catch (err) {
+      msg.textContent = "失敗:" + ((err as { message?: string })?.message ?? "未知(RLS 未套用?)");
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  el.querySelector<HTMLButtonElement>("#snt-go")!.addEventListener("click", async (ev) => {
+    const btn = ev.currentTarget as HTMLButtonElement;
+    btn.disabled = true; msg.textContent = "分析中…";
+    try {
+      const texts = items.map((m) => ((m.title ? m.title + " " : "") + (m.body ?? "")).slice(0, 500));
+      const res = await api.scoreSentiment(texts);
+      if (!res.scores) { msg.textContent = res.note ?? "情緒分析未啟用"; return; }
+      for (const s of res.scores) {
+        const b = el.querySelector<HTMLElement>(`[data-sent-idx="${s.i}"]`);
+        if (!b) continue;
+        const lab = s.label === "pos" || s.label === "neg" ? s.label : "neu";
+        b.textContent = `${lab} ${s.score}`;
+        b.className = `badge ${lab} sent`;
+        b.style.display = "";
+      }
+      msg.textContent = `✓ 已分析 ${res.scores.length} 則`;
+    } catch (err) {
+      msg.textContent = "失敗:" + ((err as { message?: string })?.message ?? "未知");
+    } finally {
+      btn.disabled = false;
+    }
+  });
 }

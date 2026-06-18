@@ -117,10 +117,67 @@ async function discover(request, url, env) {
   return json(result, 200);
 }
 
+// On-demand sentiment for discover results. Mirrors the pipeline: Gemini
+// 2.5-flash-lite with structured JSON output. Ephemeral (nothing is stored).
+async function scoreSentiment(texts, env) {
+  if (!env.GEMINI_API_KEY) {
+    return { scores: null, note: "情緒分析未啟用:Worker 尚未設定 GEMINI_API_KEY secret" };
+  }
+  const numbered = texts.map((t, i) => `${i}: ${String(t || "").replace(/\s+/g, " ").slice(0, 500)}`).join("\n");
+  const prompt = "You classify sentiment of social-media product mentions. For each "
+    + "numbered item, judge sentiment toward the main product/brand discussed. "
+    + "Return one object per item with its index i, a label (pos/neu/neg) and a "
+    + "score from -1.0 (very negative) to 1.0 (very positive).\n\nItems:\n" + numbered;
+  try {
+    const r = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${env.GEMINI_API_KEY}`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: {
+            temperature: 0,
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: "ARRAY",
+              items: {
+                type: "OBJECT",
+                properties: {
+                  i: { type: "INTEGER" },
+                  label: { type: "STRING", enum: ["pos", "neu", "neg"] },
+                  score: { type: "NUMBER" },
+                },
+                required: ["i", "label", "score"],
+              },
+            },
+          },
+        }),
+      },
+    );
+    if (!r.ok) return { scores: null, note: "Gemini HTTP " + r.status };
+    const data = await r.json();
+    const txt = data.candidates?.[0]?.content?.parts?.[0]?.text || "[]";
+    return { scores: JSON.parse(txt) };
+  } catch (e) {
+    return { scores: null, note: "Gemini 例外:" + (e?.message || "unknown") };
+  }
+}
+
+async function sentiment(request, env) {
+  if (!(await verifyUser(request, env))) return json({ error: "未授權(請重新登入)" }, 401);
+  let body;
+  try { body = await request.json(); } catch { return json({ error: "bad json" }, 400); }
+  const texts = Array.isArray(body?.texts) ? body.texts.slice(0, 25) : [];
+  if (!texts.length) return json({ error: "no texts" }, 400);
+  return json(await scoreSentiment(texts, env), 200);
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname === "/api/discover") return discover(request, url, env);
+    if (url.pathname === "/api/sentiment" && request.method === "POST") return sentiment(request, env);
     return env.ASSETS.fetch(request);  // everything else → static SPA
   },
 };

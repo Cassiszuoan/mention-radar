@@ -196,6 +196,27 @@ export const api = {
     return r.json() as Promise<DiscoverResult>;
   },
 
+  // promote-from-discover helpers
+  entityBySlug: (slug: string) =>
+    withRetry<{ id: number }[]>(() =>
+      sb.from("entities").select("id").eq("slug", slug).limit(1) as never),
+  ensureSource: (s: { platform: string; kind: string; source_key: string }) =>
+    withRetry<{ id: number }[]>(() =>
+      sb.from("sources").upsert(s, { onConflict: "platform,kind,source_key", ignoreDuplicates: true })
+        .select("id") as never),
+
+  scoreSentiment: async (texts: string[]) => {
+    const { data } = await sb.auth.getSession();
+    const token = data.session?.access_token;
+    const r = await fetch("/api/sentiment", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      body: JSON.stringify({ texts }),
+    });
+    if (!r.ok) throw new Error("情緒分析失敗 HTTP " + r.status);
+    return r.json() as Promise<{ scores: { i: number; label: string; score: number }[] | null; note?: string }>;
+  },
+
   reports: async () => {
     const out: { period: string; name: string }[] = [];
     for (const period of ["weekly", "monthly"]) {
