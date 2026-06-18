@@ -37,9 +37,22 @@ jobs:
       - name: retention + compliance
         run: python -m pipeline.run retention
       - name: keepalive (prevents 60-day cron auto-disable)
-        # commit mode (not the @v2 default API mode): matches the contents:write
-        # grant, and a dummy commit counts as repo activity for ALL workflows —
-        # API mode would only keep THIS workflow alive and needs actions:write.
-        uses: gautamkrishnar/keepalive-workflow@v2
-        with:
-          use_api: false
+        # Inline replacement for gautamkrishnar/keepalive-workflow@v2: GitHub
+        # blocks this account from downloading non-first-party actions
+        # ("Repository access blocked" at action-download), so do the dummy bump
+        # with plain git. An empty commit to the default branch counts as repo
+        # activity for ALL scheduled workflows. Fires only when the repo is >45d
+        # quiet; best-effort (continue-on-error) so compliance never goes red if
+        # the account also restricts Actions write.
+        continue-on-error: true
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          age_days=$(( ( $(date +%s) - $(git log -1 --format=%ct) ) / 86400 ))
+          echo "days since last commit: $age_days"
+          if [ "$age_days" -ge 45 ]; then
+            git commit --allow-empty -m "chore: keepalive bump (defeat 60d cron auto-disable)"
+            git push
+          else
+            echo "repo active within 45d — keepalive not needed this run"
+          fi
