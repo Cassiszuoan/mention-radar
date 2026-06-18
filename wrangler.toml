@@ -1,0 +1,12 @@
+# Cloudflare Workers static-assets deployment for the dashboard SPA.
+# The build step (`npm --prefix dashboard run build`) emits dashboard/dist;
+# this config serves that directory as a static site. Workers Static Assets is
+# Cloudflare's current path (Pages is being folded into Workers).
+# `single-page-application` makes any unknown path fall back to index.html so
+# client-side routing / deep links work.
+name = "mention-radar"
+compatibility_date = "2025-06-01"
+
+[assets]
+directory = "dashboard/dist"
+not_found_handling = "single-page-application"
