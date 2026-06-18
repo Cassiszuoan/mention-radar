@@ -7,9 +7,9 @@ import { api, sb } from "./api";
 import type { Alert, Entity } from "./api";
 import { disposeCharts } from "./charts";
 import {
-  renderAlerts, renderEntity, renderManage, renderOverview, renderReports, renderSearch,
+  renderAlerts, renderDiscover, renderEntity, renderManage, renderOverview, renderReports, renderSearch,
 } from "./views";
-import type { SearchState } from "./views";
+import type { DiscoverState, SearchState } from "./views";
 
 const app = document.getElementById("app")!;
 const POLL_MS = 60_000;
@@ -18,6 +18,10 @@ let pollTimer: number | undefined;
 let gen = 0;  // refresh generation: stale in-flight renders bail after each await
 const detailState = { range: "7d", platform: "", sourceId: "", order: "latest" };
 const searchState: SearchState = { text: "", entityId: "", platform: "", label: "", range: "7d" };
+const discoverState: DiscoverState = {
+  q: "", platform: "both",
+  subreddits: "MechanicalKeyboards,MouseReview,ASUSROG,pcmasterrace",
+};
 
 // ---------------------------------------------------------------------------
 // Auth gate
@@ -77,6 +81,7 @@ function renderShell(email: string): void {
       <nav class="tabs">
         <a href="#/" data-tab="overview">Overview</a>
         <a href="#/search" data-tab="search">搜尋</a>
+        <a href="#/discover" data-tab="discover">探索</a>
         <a href="#/alerts" data-tab="alerts">Alerts</a>
         <a href="#/reports" data-tab="reports">Reports</a>
         <a href="#/manage" data-tab="manage">管理</a>
@@ -97,6 +102,7 @@ function activeTab(): string {
   if (h.startsWith("#/reports")) return "reports";
   if (h.startsWith("#/manage")) return "manage";
   if (h.startsWith("#/search")) return "search";
+  if (h.startsWith("#/discover")) return "discover";
   if (h.startsWith("#/entity/")) return "overview";
   return "overview";
 }
@@ -135,6 +141,8 @@ async function refresh(): Promise<void> {
       await renderManage(view, alive);
     } else if (h.startsWith("#/search")) {
       await renderSearch(view, searchState, alive);
+    } else if (h.startsWith("#/discover")) {
+      await renderDiscover(view, discoverState, alive);
     } else {
       const since = new Date(Date.now() - 8 * 86400e3).toISOString();
       const [entities, agg, alerts, quality] = await Promise.all([
@@ -168,7 +176,7 @@ function wireDetailFilters(view: HTMLElement): void {
 // not blow it away. Explicit triggers (hashchange, post-mutation "refresh") still pass.
 function interactiveView(): boolean {
   const h = location.hash;
-  return h.startsWith("#/manage") || h.startsWith("#/search");
+  return h.startsWith("#/manage") || h.startsWith("#/search") || h.startsWith("#/discover");
 }
 
 function schedulePoll(): void {

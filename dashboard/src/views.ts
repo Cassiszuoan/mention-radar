@@ -1,6 +1,6 @@
 // View renderers. Each receives a container plus pre-fetched data.
 import type {
-  AggRow, Alert, Entity, EntityFull, Keyword, MentionRow, SearchFilters, SourceFull,
+  AggRow, Alert, DiscoverItem, Entity, EntityFull, Keyword, MentionRow, SearchFilters, SourceFull,
 } from "./api";
 import { api } from "./api";
 import { mountChart, sparkOption, trendOption } from "./charts";
@@ -570,4 +570,69 @@ function searchItem(m: MentionRow, entName: string): string {
       <span>${esc(m.published_at?.slice(0, 16).replace("T", " "))}</span>
       ${m.url ? `<a href="${esc(m.url)}" target="_blank" rel="noreferrer">原文 ↗</a>` : ""}
     </div>${text}</div>`;
+}
+
+// ---------------------------------------------------------------------------
+// Discover (live ad-hoc search of Reddit/YouTube via the Worker /api/discover)
+// ---------------------------------------------------------------------------
+
+export type DiscoverState = { q: string; subreddits: string; platform: string };
+
+export async function renderDiscover(
+  el: HTMLElement, state: DiscoverState, _alive: () => boolean = () => true,
+): Promise<void> {
+  el.innerHTML = `
+    <div class="filters">
+      <input id="dq" placeholder="即時搜尋任何詞(直接打 Reddit / YouTube)…" value="${esc(state.q)}" style="flex:1;min-width:200px"/>
+      <select id="d-plat">
+        <option value="both">Reddit + YouTube</option>
+        <option value="reddit">只 Reddit</option>
+        <option value="youtube">只 YouTube</option>
+      </select>
+      <button class="primary" id="dgo">探索</button>
+    </div>
+    <div class="filters" style="padding-top:0">
+      <span class="label">subreddits</span>
+      <input id="dsubs" placeholder="逗號分隔,Reddit 全文搜尋需指定版面" value="${esc(state.subreddits)}" style="flex:1;min-width:240px"/>
+    </div>
+    <p class="hint">即時打外部 API、不寫入資料庫、無情緒分析。Reddit 在你指定的 subreddit 內搜;YouTube 為全站搜尋(需後端已設 YT_API_KEY)。</p>
+    <div id="dresults"><div class="empty">輸入關鍵字後按探索</div></div>`;
+
+  (el.querySelector("#d-plat") as HTMLSelectElement).value = state.platform || "both";
+  const results = el.querySelector<HTMLElement>("#dresults")!;
+  const run = async () => {
+    state.q = val(el, "#dq");
+    state.subreddits = val(el, "#dsubs");
+    state.platform = (el.querySelector("#d-plat") as HTMLSelectElement).value;
+    if (!state.q) { results.innerHTML = `<div class="empty">請輸入搜尋字</div>`; return; }
+    results.innerHTML = `<div class="empty">即時搜尋中…(可能要幾秒)</div>`;
+    try {
+      const r = await api.discover({ q: state.q, platform: state.platform, subreddits: state.subreddits, limit: 10 });
+      const blocks: string[] = [];
+      if (r.notes?.length) blocks.push(`<div class="hint">${r.notes.map(esc).join(" · ")}</div>`);
+      if (r.reddit?.length) blocks.push(`<h2 class="sect">Reddit <em>${r.reddit.length}</em></h2>` + r.reddit.map(discoverItem).join(""));
+      if (r.youtube?.length) blocks.push(`<h2 class="sect">YouTube <em>${r.youtube.length}</em></h2>` + r.youtube.map(discoverItem).join(""));
+      results.innerHTML = blocks.length ? blocks.join("") : `<div class="empty">查無即時結果</div>`;
+    } catch (err) {
+      results.innerHTML = `<div class="empty">探索失敗(${esc((err as { message?: string })?.message ?? "未知")})</div>`;
+    }
+  };
+  el.querySelector<HTMLButtonElement>("#dgo")!.addEventListener("click", run);
+  el.querySelector<HTMLInputElement>("#dq")!.addEventListener("keydown", (e) => { if (e.key === "Enter") run(); });
+  if (state.q) run();
+}
+
+function discoverItem(m: DiscoverItem): string {
+  const when = typeof m.created === "number"
+    ? new Date(m.created * 1000).toISOString().slice(0, 16).replace("T", " ")
+    : (typeof m.created === "string" ? m.created.slice(0, 16).replace("T", " ") : "");
+  const src = m.platform === "reddit" ? `r/${esc(m.subreddit ?? "")}` : esc(m.channel ?? "youtube");
+  const body = ((m.title ? m.title + " — " : "") + (m.body ?? "")).slice(0, 500);
+  return `<div class="mention">
+    <div class="head">
+      <span class="badge neu">${esc(m.platform)}·${esc(m.kind)}</span>
+      <span>${src}</span>
+      <span>${esc(when)}</span>
+      ${m.url ? `<a href="${esc(m.url)}" target="_blank" rel="noreferrer">原文 ↗</a>` : ""}
+    </div><div class="body">${esc(body)}</div></div>`;
 }

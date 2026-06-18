@@ -56,6 +56,12 @@ export type SourceFull = {
 export type SearchFilters = {
   text?: string; entityId?: number; platform?: string; label?: string; sinceIso?: string;
 };
+export type DiscoverItem = {
+  platform: string; kind: string; subreddit?: string; channel?: string;
+  title: string | null; body: string; url: string;
+  created: number | string | null; score?: number | null;
+};
+export type DiscoverResult = { reddit: DiscoverItem[]; youtube: DiscoverItem[]; notes: string[] };
 
 // Laptop-wakes-from-sleep path: a stale JWT must not render as "no alerts".
 async function withRetry<T>(fn: () => Promise<{ data: T | null; error: unknown }>): Promise<T> {
@@ -173,6 +179,22 @@ export const api = {
       if (f.sinceIso) q = q.gte("published_at", f.sinceIso);
       return q.order("published_at", { ascending: false }).limit(100) as never;
     }),
+
+  // Live ad-hoc discovery via the Worker /api/discover (server holds the keys).
+  discover: async (p: { q: string; platform: string; subreddits: string; limit?: number }) => {
+    const { data } = await sb.auth.getSession();
+    const token = data.session?.access_token;
+    const u = new URL("/api/discover", location.origin);
+    u.searchParams.set("q", p.q);
+    u.searchParams.set("platform", p.platform);
+    if (p.subreddits) u.searchParams.set("subreddits", p.subreddits);
+    u.searchParams.set("limit", String(p.limit ?? 10));
+    const r = await fetch(u.toString(), {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    if (!r.ok) throw new Error("探索失敗 HTTP " + r.status);
+    return r.json() as Promise<DiscoverResult>;
+  },
 
   reports: async () => {
     const out: { period: string; name: string }[] = [];
