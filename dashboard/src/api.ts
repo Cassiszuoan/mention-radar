@@ -163,8 +163,10 @@ export const api = {
   searchMentions: (f: SearchFilters) =>
     withRetry<MentionRow[]>(() => {
       let q = sb.from("v_mentions").select("*");
+      // PostgREST or()-filter wildcard is '*', not SQL '%'. Strip both (plus
+      // chars that break the or() grammar) from user input, then wrap in '*'.
       const t = (f.text ?? "").replace(/[,%()"'\\*]/g, " ").trim();
-      if (t) q = q.or(`title.ilike.%${t}%,body.ilike.%${t}%`);
+      if (t) q = q.or(`title.ilike.*${t}*,body.ilike.*${t}*`);
       if (f.entityId) q = q.eq("entity_id", f.entityId);
       if (f.platform) q = q.eq("platform", f.platform);
       if (f.label) q = q.eq("label", f.label);
