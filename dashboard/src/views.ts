@@ -1,5 +1,7 @@
 // View renderers. Each receives a container plus pre-fetched data.
-import type { AggRow, Alert, Entity, MentionRow } from "./api";
+import type {
+  AggRow, Alert, Entity, EntityFull, Keyword, MentionRow, SearchFilters, SourceFull,
+} from "./api";
 import { api } from "./api";
 import { mountChart, sparkOption, trendOption } from "./charts";
 
@@ -335,4 +337,237 @@ export async function renderReports(el: HTMLElement, alive: () => boolean = () =
       const url = await api.reportUrl(b.dataset.p!, b.dataset.n!);
       window.open(url, "_blank", "noreferrer");
     }));
+}
+
+// ---------------------------------------------------------------------------
+// Manage (operator CRUD: entities / keywords / sources + per-entity thresholds)
+// ---------------------------------------------------------------------------
+
+function val(root: ParentNode, sel: string): string {
+  return (root.querySelector(sel) as HTMLInputElement | null)?.value.trim() ?? "";
+}
+
+export async function renderManage(el: HTMLElement, alive: () => boolean = () => true): Promise<void> {
+  const [ents, kws, srcs] = await Promise.all([
+    api.manageEntities(), api.manageKeywords(), api.manageSources(),
+  ]);
+  if (!alive()) return;
+  const kwBy = new Map<number, Keyword[]>();
+  for (const k of kws) {
+    const arr = kwBy.get(k.entity_id);
+    if (arr) arr.push(k); else kwBy.set(k.entity_id, [k]);
+  }
+
+  const entRow = (e: EntityFull) => {
+    const mc = e.thresholds?.volume?.min_count ?? "";
+    const dr = e.thresholds?.sentiment?.drop ?? "";
+    const ks = kwBy.get(e.id) ?? [];
+    return `<div class="mrow" data-ent="${e.id}">
+      <div class="mhead">
+        <b>${esc(e.name)}</b>
+        <span class="label">${e.side === "ours" ? "我方" : "競品"}</span>
+        <code>${esc(e.slug)}</code>
+        <label class="chk"><input type="checkbox" data-f="active" ${e.active ? "checked" : ""}/> 啟用</label>
+        <span class="thr">聲量 min_count <input type="number" min="0" data-f="min_count" value="${mc}"/></span>
+        <span class="thr">情緒 drop <input type="number" step="0.05" data-f="drop" value="${dr}"/></span>
+        <span style="flex:1"></span>
+        <button data-act="ent-save">儲存</button>
+        <button class="danger" data-act="ent-del">刪除</button>
+      </div>
+      <div class="kwbox">
+        ${ks.map((k) => `<span class="kw" data-kw="${k.id}">${esc(k.keyword)}<i>${esc(k.match_type)}</i>
+          <button data-act="kw-del" title="刪除關鍵字">×</button></span>`).join("")}
+        <span class="kw add">
+          <input data-f="kw" placeholder="新關鍵字"/>
+          <select data-f="mt"><option value="phrase">phrase</option><option value="word">word</option><option value="regex">regex</option></select>
+          <button data-act="kw-add">＋ 加字</button>
+        </span>
+      </div>
+    </div>`;
+  };
+
+  el.innerHTML = `
+    <h2 class="sect">監測標的 <em>entities + keywords</em></h2>
+    <div class="addbar">
+      <input id="ne-slug" placeholder="slug(英數-連字號,如 rog-ally)"/>
+      <input id="ne-name" placeholder="顯示名稱"/>
+      <select id="ne-side"><option value="ours">我方</option><option value="competitor">競品</option></select>
+      <button class="primary" data-act="ent-add">＋ 新增產品</button>
+    </div>
+    <div class="mlist">${ents.map(entRow).join("") || `<div class="empty">尚無標的</div>`}</div>
+
+    <h2 class="sect">來源 <em>sources</em></h2>
+    <div class="addbar">
+      <select id="ns-plat"><option value="reddit">reddit</option><option value="youtube">youtube</option></select>
+      <select id="ns-kind"><option value="subreddit">subreddit</option><option value="search">search</option><option value="channel">channel</option></select>
+      <input id="ns-key" placeholder="source_key(subreddit 名 / 搜尋詞 / YouTube 頻道ID)" style="min-width:240px"/>
+      <button class="primary" data-act="src-add">＋ 新增來源</button>
+    </div>
+    <table class="data"><thead><tr><th>platform</th><th>kind</th><th>source_key</th><th>啟用</th><th></th></tr></thead>
+    <tbody>${srcs.map((s) => `<tr data-src="${s.id}">
+      <td>${esc(s.platform)}</td><td>${esc(s.kind)}</td>
+      <td style="font-family:var(--mono)">${esc(s.source_key)}</td>
+      <td><input type="checkbox" data-f="active" ${s.active ? "checked" : ""}/></td>
+      <td><button data-act="src-save">儲存</button> <button class="danger" data-act="src-del">刪除</button></td>
+    </tr>`).join("") || `<tr><td colspan="5" class="empty">尚無來源</td></tr>`}</tbody></table>
+    <p class="hint">改完下一輪 cron(≤20 分)自動套用。刪除產品會連同其關鍵字與留言關聯一併移除;停用來源(取消勾選後儲存)會保留游標、暫停抓取。</p>`;
+
+  wireManage(el);
+}
+
+async function mutate(btn: HTMLButtonElement, fn: () => Promise<{ id: number }[]>): Promise<void> {
+  const orig = btn.textContent;
+  btn.disabled = true; btn.textContent = "…";
+  try {
+    const rows = await fn();
+    if (!rows.length) throw new Error("沒有更新任何列(權限不足?)");
+    dispatchEvent(new CustomEvent("refresh"));
+  } catch (err) {
+    btn.disabled = false; btn.textContent = orig ?? "失敗";
+    const msg = (err as { message?: string })?.message ?? "未知錯誤";
+    btn.title = msg;
+    alert("操作失敗:" + msg);
+  }
+}
+
+function wireManage(el: HTMLElement): void {
+  el.querySelectorAll<HTMLButtonElement>("button[data-act]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const act = btn.dataset.act!;
+      if (act === "ent-add") {
+        const slug = val(el, "#ne-slug"), name = val(el, "#ne-name");
+        const side = (el.querySelector("#ne-side") as HTMLSelectElement).value;
+        if (!slug || !name) { alert("請填 slug 與顯示名稱"); return; }
+        void mutate(btn, () => api.addEntity({ slug, name, side }));
+        return;
+      }
+      if (act === "src-add") {
+        const platform = (el.querySelector("#ns-plat") as HTMLSelectElement).value;
+        const kind = (el.querySelector("#ns-kind") as HTMLSelectElement).value;
+        const source_key = val(el, "#ns-key");
+        if (!source_key) { alert("請填 source_key"); return; }
+        void mutate(btn, () => api.addSource({ platform, kind, source_key }));
+        return;
+      }
+      const mrow = btn.closest<HTMLElement>(".mrow");
+      if (act === "ent-save" && mrow) {
+        const id = Number(mrow.dataset.ent);
+        const active = (mrow.querySelector("[data-f=active]") as HTMLInputElement).checked;
+        const mc = val(mrow, "[data-f=min_count]"), dr = val(mrow, "[data-f=drop]");
+        const thresholds: Record<string, unknown> = {};
+        if (mc !== "") thresholds.volume = { min_count: Number(mc) };
+        if (dr !== "") thresholds.sentiment = { drop: Number(dr) };
+        void mutate(btn, () => api.updEntity(id, { active, thresholds }));
+        return;
+      }
+      if (act === "ent-del" && mrow) {
+        if (!confirm("確定刪除此產品?其關鍵字與留言關聯會一併移除。")) return;
+        void mutate(btn, () => api.delEntity(Number(mrow.dataset.ent)));
+        return;
+      }
+      if (act === "kw-add" && mrow) {
+        const box = btn.closest<HTMLElement>(".kw.add")!;
+        const keyword = val(box, "[data-f=kw]");
+        const match_type = (box.querySelector("[data-f=mt]") as HTMLSelectElement).value;
+        if (!keyword) { alert("請填關鍵字"); return; }
+        void mutate(btn, () => api.addKeyword({ entity_id: Number(mrow.dataset.ent), keyword, match_type }));
+        return;
+      }
+      if (act === "kw-del") {
+        const chip = btn.closest<HTMLElement>(".kw[data-kw]")!;
+        void mutate(btn, () => api.delKeyword(Number(chip.dataset.kw)));
+        return;
+      }
+      const tr = btn.closest<HTMLElement>("tr[data-src]");
+      if (act === "src-save" && tr) {
+        const active = (tr.querySelector("[data-f=active]") as HTMLInputElement).checked;
+        void mutate(btn, () => api.updSource(Number(tr.dataset.src), { active }));
+        return;
+      }
+      if (act === "src-del" && tr) {
+        if (!confirm("確定刪除此來源?")) return;
+        void mutate(btn, () => api.delSource(Number(tr.dataset.src)));
+        return;
+      }
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Search (free-text / faceted mention search across all entities)
+// ---------------------------------------------------------------------------
+
+export type SearchState = {
+  text: string; entityId: string; platform: string; label: string; range: string;
+};
+
+export async function renderSearch(
+  el: HTMLElement, state: SearchState, alive: () => boolean = () => true,
+): Promise<void> {
+  const ents = await api.manageEntities();
+  if (!alive()) return;
+  const opt = (v: string, label: string, cur: string) =>
+    `<option value="${esc(v)}" ${v === cur ? "selected" : ""}>${esc(label)}</option>`;
+  el.innerHTML = `
+    <div class="filters">
+      <input id="q" placeholder="搜尋留言內文 / 標題…" value="${esc(state.text)}" style="flex:1;min-width:180px"/>
+      <select id="f-ent"><option value="">全部標的</option>${
+        ents.map((e) => opt(String(e.id), e.name, state.entityId)).join("")}</select>
+      <select id="f-plat">${["", "reddit", "youtube"].map((p) => opt(p, p || "全平台", state.platform)).join("")}</select>
+      <select id="f-label">${([["", "全情緒"], ["pos", "正面"], ["neu", "中性"], ["neg", "負面"]] as [string, string][])
+        .map(([v, l]) => opt(v, l, state.label)).join("")}</select>
+      <select id="f-range">${([["7d", "近 7 天"], ["30d", "近 30 天"], ["90d", "近 90 天"], ["all", "全部"]] as [string, string][])
+        .map(([v, l]) => opt(v, l, state.range)).join("")}</select>
+      <button class="primary" id="go">搜尋</button>
+    </div>
+    <div id="results"><div class="empty">設定條件後按搜尋</div></div>`;
+
+  const results = el.querySelector<HTMLElement>("#results")!;
+  const nameById = new Map(ents.map((e) => [e.id, e.name]));
+  const run = async () => {
+    state.text = val(el, "#q");
+    state.entityId = (el.querySelector("#f-ent") as HTMLSelectElement).value;
+    state.platform = (el.querySelector("#f-plat") as HTMLSelectElement).value;
+    state.label = (el.querySelector("#f-label") as HTMLSelectElement).value;
+    state.range = (el.querySelector("#f-range") as HTMLSelectElement).value;
+    const days = ({ "7d": 7, "30d": 30, "90d": 90 } as Record<string, number>)[state.range];
+    const f: SearchFilters = {
+      text: state.text || undefined,
+      entityId: state.entityId ? Number(state.entityId) : undefined,
+      platform: state.platform || undefined,
+      label: state.label || undefined,
+      sinceIso: days ? new Date(Date.now() - days * 86400e3).toISOString() : undefined,
+    };
+    results.innerHTML = `<div class="empty">搜尋中…</div>`;
+    try {
+      const rows = await api.searchMentions(f);
+      results.innerHTML = rows.length
+        ? `<div class="hint">${rows.length} 則(上限 100,依時間新→舊)</div>` +
+          rows.map((m) => searchItem(m, nameById.get(m.entity_id) ?? m.name ?? "")).join("")
+        : `<div class="empty">查無符合條件的留言</div>`;
+    } catch (err) {
+      results.innerHTML = `<div class="empty">搜尋失敗(${esc((err as { message?: string })?.message ?? "未知")})</div>`;
+    }
+  };
+  el.querySelector<HTMLButtonElement>("#go")!.addEventListener("click", run);
+  el.querySelector<HTMLInputElement>("#q")!.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") run();
+  });
+  if (state.text || state.entityId || state.platform || state.label) run();
+}
+
+function searchItem(m: MentionRow, entName: string): string {
+  const label = m.label
+    ? `<span class="badge ${esc(m.label)}">${esc(m.label)} ${m.sentiment ?? ""}</span>` : "";
+  const text = m.body_purged_at
+    ? `<div class="body purged">原文已依資料保留政策清除</div>`
+    : `<div class="body">${esc(((m.title ? m.title + " — " : "") + (m.body ?? "")).slice(0, 600))}</div>`;
+  return `<div class="mention">
+    <div class="head">
+      ${label}
+      <a href="#/entity/${esc(m.slug)}" style="color:var(--amber)">${esc(entName)}</a>
+      <span>${esc(m.platform)} · ${esc(m.kind)}</span>
+      <span>${esc(m.published_at?.slice(0, 16).replace("T", " "))}</span>
+      ${m.url ? `<a href="${esc(m.url)}" target="_blank" rel="noreferrer">原文 ↗</a>` : ""}
+    </div>${text}</div>`;
 }

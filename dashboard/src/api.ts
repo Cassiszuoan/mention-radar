@@ -35,6 +35,28 @@ export type MentionRow = {
   sentiment: number | null; label: string | null; aspects: { name: string; score: number }[] | null;
 };
 
+// --- management types (operator CRUD over monitoring targets) ---
+export type Thresholds = {
+  volume?: { min_count?: number; z?: number; high_z?: number };
+  sentiment?: { drop?: number };
+  [k: string]: unknown;
+};
+export type EntityFull = {
+  id: number; slug: string; name: string; side: "ours" | "competitor";
+  active: boolean; thresholds: Thresholds;
+};
+export type Keyword = {
+  id: number; entity_id: number; keyword: string; match_type: string;
+  lang: string | null; active: boolean;
+};
+export type SourceFull = {
+  id: number; platform: string; kind: string; source_key: string;
+  config: Record<string, unknown>; active: boolean;
+};
+export type SearchFilters = {
+  text?: string; entityId?: number; platform?: string; label?: string; sinceIso?: string;
+};
+
 // Laptop-wakes-from-sleep path: a stale JWT must not render as "no alerts".
 async function withRetry<T>(fn: () => Promise<{ data: T | null; error: unknown }>): Promise<T> {
   let res = await fn();
@@ -97,6 +119,58 @@ export const api = {
   quality: () =>
     withRetry<{ job: string; started_at: string; status: string; stats: Record<string, unknown> }[]>(
       () => sb.from("v_data_quality").select("*") as never),
+
+  // --- management (operator writes; RLS-gated to the authenticated operator) ---
+  manageEntities: () =>
+    withRetry<EntityFull[]>(() =>
+      sb.from("entities").select("id, slug, name, side, active, thresholds")
+        .order("side").order("name") as never),
+  manageKeywords: () =>
+    withRetry<Keyword[]>(() =>
+      sb.from("keywords").select("id, entity_id, keyword, match_type, lang, active")
+        .order("entity_id") as never),
+  manageSources: () =>
+    withRetry<SourceFull[]>(() =>
+      sb.from("sources").select("id, platform, kind, source_key, config, active")
+        .order("platform").order("kind") as never),
+
+  addEntity: (e: { slug: string; name: string; side: string }) =>
+    withRetry<{ id: number }[]>(() => sb.from("entities").insert(e).select("id") as never),
+  updEntity: (id: number, patch: Record<string, unknown>) =>
+    withRetry<{ id: number }[]>(() =>
+      sb.from("entities").update(patch).eq("id", id).select("id") as never),
+  delEntity: (id: number) =>
+    withRetry<{ id: number }[]>(() =>
+      sb.from("entities").delete().eq("id", id).select("id") as never),
+
+  addKeyword: (k: { entity_id: number; keyword: string; match_type: string }) =>
+    withRetry<{ id: number }[]>(() => sb.from("keywords").insert(k).select("id") as never),
+  delKeyword: (id: number) =>
+    withRetry<{ id: number }[]>(() =>
+      sb.from("keywords").delete().eq("id", id).select("id") as never),
+
+  addSource: (s: { platform: string; kind: string; source_key: string }) =>
+    withRetry<{ id: number }[]>(() => sb.from("sources").insert(s).select("id") as never),
+  updSource: (id: number, patch: Record<string, unknown>) =>
+    withRetry<{ id: number }[]>(() =>
+      sb.from("sources").update(patch).eq("id", id).select("id") as never),
+  delSource: (id: number) =>
+    withRetry<{ id: number }[]>(() =>
+      sb.from("sources").delete().eq("id", id).select("id") as never),
+
+  // Free-text mention search across all entities. Sanitize the term: commas /
+  // parens / quotes / % would break PostgREST's or()-filter grammar.
+  searchMentions: (f: SearchFilters) =>
+    withRetry<MentionRow[]>(() => {
+      let q = sb.from("v_mentions").select("*");
+      const t = (f.text ?? "").replace(/[,%()"'\\*]/g, " ").trim();
+      if (t) q = q.or(`title.ilike.%${t}%,body.ilike.%${t}%`);
+      if (f.entityId) q = q.eq("entity_id", f.entityId);
+      if (f.platform) q = q.eq("platform", f.platform);
+      if (f.label) q = q.eq("label", f.label);
+      if (f.sinceIso) q = q.gte("published_at", f.sinceIso);
+      return q.order("published_at", { ascending: false }).limit(100) as never;
+    }),
 
   reports: async () => {
     const out: { period: string; name: string }[] = [];

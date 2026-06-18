@@ -6,7 +6,10 @@ import "./style.css";
 import { api, sb } from "./api";
 import type { Alert, Entity } from "./api";
 import { disposeCharts } from "./charts";
-import { renderAlerts, renderEntity, renderOverview, renderReports } from "./views";
+import {
+  renderAlerts, renderEntity, renderManage, renderOverview, renderReports, renderSearch,
+} from "./views";
+import type { SearchState } from "./views";
 
 const app = document.getElementById("app")!;
 const POLL_MS = 60_000;
@@ -14,6 +17,7 @@ const POLL_MS = 60_000;
 let pollTimer: number | undefined;
 let gen = 0;  // refresh generation: stale in-flight renders bail after each await
 const detailState = { range: "7d", platform: "", sourceId: "", order: "latest" };
+const searchState: SearchState = { text: "", entityId: "", platform: "", label: "", range: "7d" };
 
 // ---------------------------------------------------------------------------
 // Auth gate
@@ -72,8 +76,10 @@ function renderShell(email: string): void {
       <span class="brand">mention<span class="dot">·</span>radar</span>
       <nav class="tabs">
         <a href="#/" data-tab="overview">Overview</a>
+        <a href="#/search" data-tab="search">搜尋</a>
         <a href="#/alerts" data-tab="alerts">Alerts</a>
         <a href="#/reports" data-tab="reports">Reports</a>
+        <a href="#/manage" data-tab="manage">管理</a>
       </nav>
       <span class="userbox">${email}<button id="logout">登出</button></span>
     </header>
@@ -89,6 +95,8 @@ function activeTab(): string {
   const h = location.hash;
   if (h.startsWith("#/alerts")) return "alerts";
   if (h.startsWith("#/reports")) return "reports";
+  if (h.startsWith("#/manage")) return "manage";
+  if (h.startsWith("#/search")) return "search";
   if (h.startsWith("#/entity/")) return "overview";
   return "overview";
 }
@@ -123,6 +131,10 @@ async function refresh(): Promise<void> {
       renderAlerts(view, alerts);
     } else if (h.startsWith("#/reports")) {
       await renderReports(view, alive);
+    } else if (h.startsWith("#/manage")) {
+      await renderManage(view, alive);
+    } else if (h.startsWith("#/search")) {
+      await renderSearch(view, searchState, alive);
     } else {
       const since = new Date(Date.now() - 8 * 86400e3).toISOString();
       const [entities, agg, alerts, quality] = await Promise.all([
@@ -152,15 +164,22 @@ function wireDetailFilters(view: HTMLElement): void {
   sel?.addEventListener("change", () => { detailState.sourceId = sel.value; refresh(); });
 }
 
+// Manage/Search hold un-saved form state; auto-refresh (poll, tab refocus) must
+// not blow it away. Explicit triggers (hashchange, post-mutation "refresh") still pass.
+function interactiveView(): boolean {
+  const h = location.hash;
+  return h.startsWith("#/manage") || h.startsWith("#/search");
+}
+
 function schedulePoll(): void {
   if (pollTimer) clearInterval(pollTimer);
-  pollTimer = window.setInterval(refresh, POLL_MS);
+  pollTimer = window.setInterval(() => { if (!interactiveView()) refresh(); }, POLL_MS);
 }
 
 addEventListener("hashchange", () => refresh());
 addEventListener("refresh", () => refresh());
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) refresh();  // laptop wake → immediate refresh (api retries 401)
+  if (!document.hidden && !interactiveView()) refresh();  // laptop wake → refresh (api retries 401)
 });
 
 boot();
