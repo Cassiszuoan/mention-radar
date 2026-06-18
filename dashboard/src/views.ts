@@ -194,7 +194,7 @@ export async function renderEntity(
     <h2 class="sect">mention 流
       <span style="float:right">${seg("order", ["latest", "negative", "engaged"], state.order)}</span></h2>
     <div id="aspects"></div>
-    <div id="feed"><div class="empty">載入中…</div></div>`;
+    <div id="feed"><div class="loading">載入中…</div></div>`;
 
   if (sentiment.length || volume.length) {
     mountChart(el.querySelector<HTMLElement>("#trend")!)
@@ -263,7 +263,7 @@ export function renderAlerts(el: HTMLElement, alerts: Alert[]): void {
     return;
   }
   el.innerHTML = `<h2 class="sect">警報 <em>alerts</em></h2>
-    <table class="data"><thead><tr>
+    <div class="tbl-wrap"><table class="data"><thead><tr>
       <th>severity</th><th>entity</th><th>type</th><th>window</th>
       <th>observed / baseline</th><th>z</th><th>status</th><th></th>
     </tr></thead><tbody>${alerts.map((a) => `
@@ -290,7 +290,7 @@ export function renderAlerts(el: HTMLElement, alerts: Alert[]): void {
           </div><div class="body">${esc(ev.summary ?? "")}</div></div>`).join("")
           || `<div class="empty">無固化證據</div>`}
       </td></tr>`).join("")}
-    </tbody></table>`;
+    </tbody></table></div>`;
 
   el.querySelectorAll<HTMLButtonElement>("button[data-act]").forEach((btn) => {
     btn.addEventListener("click", async (e) => {
@@ -326,12 +326,12 @@ export async function renderReports(el: HTMLElement, alive: () => boolean = () =
     return;
   }
   el.innerHTML = `<h2 class="sect">報告 <em>reports</em></h2>
-    <table class="data"><thead><tr><th>period</th><th>file</th><th></th></tr></thead>
+    <div class="tbl-wrap"><table class="data"><thead><tr><th>period</th><th>file</th><th></th></tr></thead>
     <tbody>${reports.map((r) => `
       <tr><td>${esc(r.period)}</td>
           <td style="font-family:var(--mono)">${esc(r.name)}</td>
           <td><button data-p="${esc(r.period)}" data-n="${esc(r.name)}">開啟 ↗</button></td></tr>`).join("")}
-    </tbody></table>`;
+    </tbody></table></div>`;
   el.querySelectorAll<HTMLButtonElement>("button[data-p]").forEach((b) =>
     b.addEventListener("click", async () => {
       const url = await api.reportUrl(b.dataset.p!, b.dataset.n!);
@@ -403,13 +403,13 @@ export async function renderManage(el: HTMLElement, alive: () => boolean = () =>
       <input id="ns-key" placeholder="source_key(subreddit 名 / 搜尋詞 / YouTube 頻道ID)" style="min-width:240px"/>
       <button class="primary" data-act="src-add">＋ 新增來源</button>
     </div>
-    <table class="data"><thead><tr><th>platform</th><th>kind</th><th>source_key</th><th>啟用</th><th></th></tr></thead>
+    <div class="tbl-wrap"><table class="data"><thead><tr><th>platform</th><th>kind</th><th>source_key</th><th>啟用</th><th></th></tr></thead>
     <tbody>${srcs.map((s) => `<tr data-src="${s.id}">
       <td>${esc(s.platform)}</td><td>${esc(s.kind)}</td>
       <td style="font-family:var(--mono)">${esc(s.source_key)}</td>
       <td><input type="checkbox" data-f="active" ${s.active ? "checked" : ""}/></td>
       <td><button data-act="src-save">儲存</button> <button class="danger" data-act="src-del">刪除</button></td>
-    </tr>`).join("") || `<tr><td colspan="5" class="empty">尚無來源</td></tr>`}</tbody></table>
+    </tr>`).join("") || `<tr><td colspan="5" class="empty">尚無來源</td></tr>`}</tbody></table></div>
     <p class="hint">改完下一輪 cron(≤20 分)自動套用。刪除產品會連同其關鍵字與留言關聯一併移除;停用來源(取消勾選後儲存)會保留游標、暫停抓取。</p>`;
 
   wireManage(el);
@@ -538,7 +538,7 @@ export async function renderSearch(
       label: state.label || undefined,
       sinceIso: days ? new Date(Date.now() - days * 86400e3).toISOString() : undefined,
     };
-    results.innerHTML = `<div class="empty">搜尋中…</div>`;
+    results.innerHTML = `<div class="loading">搜尋中…</div>`;
     try {
       const rows = await api.searchMentions(f);
       results.innerHTML = rows.length
@@ -605,9 +605,9 @@ export async function renderDiscover(
     state.subreddits = val(el, "#dsubs");
     state.platform = (el.querySelector("#d-plat") as HTMLSelectElement).value;
     if (!state.q) { results.innerHTML = `<div class="empty">請輸入搜尋字</div>`; return; }
-    results.innerHTML = `<div class="empty">即時搜尋中…(可能要幾秒)</div>`;
+    results.innerHTML = `<div class="loading">即時搜尋中…(可能要幾秒)</div>`;
     try {
-      const r = await api.discover({ q: state.q, platform: state.platform, subreddits: state.subreddits, limit: 80 });
+      const r = await api.discover({ q: state.q, platform: state.platform, subreddits: state.subreddits, limit: 120 });
       const items = [...(r.reddit ?? []), ...(r.youtube ?? [])];
       const notes = r.notes?.length ? `<div class="hint">${r.notes.map(esc).join(" · ")}</div>` : "";
       if (!items.length) { results.innerHTML = notes + `<div class="empty">查無即時結果</div>`; return; }
@@ -711,5 +711,120 @@ function wireDiscoverActions(el: HTMLElement, state: DiscoverState, items: Disco
     } finally {
       btn.disabled = false;
     }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Compare (operator picks 2-4 entities, side-by-side metrics + sparklines)
+// ---------------------------------------------------------------------------
+
+export type CompareState = { ids: number[] };
+
+function compare7d(rows: AggRow[], entityId: number, now: Date): {
+  vol7d: number; pos: number; neu: number; neg: number; analyzed: number;
+} {
+  const h7 = now.getTime() - 7 * 86400e3;
+  let vol7d = 0, pos = 0, neu = 0, neg = 0, analyzed = 0;
+  for (const r of rows) {
+    if (r.entity_id !== entityId) continue;
+    if (new Date(r.bucket).getTime() < h7) continue;
+    vol7d += r.mention_n;
+    pos += r.pos_n; neu += r.neu_n; neg += r.neg_n; analyzed += r.analyzed_n;
+  }
+  return { vol7d, pos, neu, neg, analyzed };
+}
+
+export async function renderCompare(
+  el: HTMLElement, state: CompareState, alive: () => boolean = () => true,
+): Promise<void> {
+  const entities = await api.entities();
+  if (!alive()) return;
+  const known = new Set(entities.map((e) => e.id));
+  state.ids = state.ids.filter((id) => known.has(id)).slice(0, 4);
+
+  const now = new Date();
+  const since = new Date(now.getTime() - 7 * 86400e3).toISOString();
+  const agg = state.ids.length ? await api.aggHourly(since) : [];
+  if (!alive()) return;
+
+  const ours = entities.filter((e) => e.side === "ours");
+  const comp = entities.filter((e) => e.side === "competitor");
+  const pickCol = (group: Entity[], title: string) => group.length
+    ? `<div class="cmp-group"><span class="label">${title}</span>` +
+      group.map((e) => {
+        const on = state.ids.includes(e.id);
+        const full = !on && state.ids.length >= 4;
+        return `<label class="chk"><input type="checkbox" data-cmp="${e.id}"
+          ${on ? "checked" : ""} ${full ? "disabled" : ""}/> ${esc(e.name)}</label>`;
+      }).join("") + `</div>`
+    : "";
+
+  const picker = `<div class="filters cmp-pick">
+    <span style="font:600 16px var(--sans);color:var(--ink-strong)">對比</span>
+    ${pickCol(ours, "我方")}${pickCol(comp, "競品")}
+  </div>`;
+
+  if (state.ids.length < 2) {
+    el.innerHTML = picker + `<div class="empty">勾選 2-4 個標的進行對比(上限 4)</div>`;
+    wireCompare(el, state);
+    return;
+  }
+
+  const cols = state.ids
+    .map((id) => entities.find((e) => e.id === id))
+    .filter((e): e is Entity => !!e)
+    .map((e) => ({ e, roll: rollup(agg, e.id, now), wk: compare7d(agg, e.id, now) }));
+
+  const headCells = cols.map((c) =>
+    `<th><a href="#/entity/${esc(c.e.slug)}" style="color:var(--cyan)">${esc(c.e.name)}</a>
+      <span class="label" style="display:block;margin-top:2px">${c.e.side === "ours" ? "我方" : "競品"}</span></th>`).join("");
+
+  const rowVol24 = cols.map((c) => `<td>${c.roll.vol24}</td>`).join("");
+  const rowDelta = cols.map((c) => `<td>${fmtDelta(c.roll.vol24 - c.roll.vol24Prev)}</td>`).join("");
+  const rowVol7d = cols.map((c) => `<td>${c.wk.vol7d}</td>`).join("");
+  const rowSent = cols.map((c) =>
+    `<td style="color:${sentColor(c.roll.sent24)};font-family:var(--mono)">${c.roll.sent24 ?? "—"}</td>`).join("");
+  const rowSplit = cols.map((c) => {
+    const { pos, neu, neg, analyzed } = c.wk;
+    return analyzed
+      ? `<td><span class="badge pos">${pos}</span> <span class="badge neu">${neu}</span> <span class="badge neg">${neg}</span></td>`
+      : `<td><span class="flat">—</span></td>`;
+  }).join("");
+  const rowSpark = cols.map((_, i) => `<td><div class="spark" data-spark="${i}"></div></td>`).join("");
+
+  el.innerHTML = picker + `
+    <div class="tbl-wrap"><table class="data cmp"><thead><tr><th>指標</th>${headCells}</tr></thead>
+    <tbody>
+      <tr><td>24h 聲量</td>${rowVol24}</tr>
+      <tr><td>vs 前 24h</td>${rowDelta}</tr>
+      <tr><td>7d 聲量</td>${rowVol7d}</tr>
+      <tr><td>24h 情緒</td>${rowSent}</tr>
+      <tr><td>7d 正/中/負</td>${rowSplit}</tr>
+      <tr><td>情緒走勢 7d</td>${rowSpark}</tr>
+    </tbody></table></div>`;
+
+  cols.forEach((c, i) => {
+    const sparkEl = el.querySelector<HTMLElement>(`.spark[data-spark="${i}"]`);
+    if (sparkEl && c.roll.spark.length > 1) {
+      mountChart(sparkEl).setOption(sparkOption(c.roll.spark));
+    } else if (sparkEl) {
+      sparkEl.innerHTML = `<span class="empty" style="padding:0;font-size:10px">無資料</span>`;
+    }
+  });
+
+  wireCompare(el, state);
+}
+
+function wireCompare(el: HTMLElement, state: CompareState): void {
+  el.querySelectorAll<HTMLInputElement>("input[data-cmp]").forEach((cb) => {
+    cb.addEventListener("change", () => {
+      const id = Number(cb.dataset.cmp);
+      if (cb.checked) {
+        if (!state.ids.includes(id) && state.ids.length < 4) state.ids.push(id);
+      } else {
+        state.ids = state.ids.filter((x) => x !== id);
+      }
+      dispatchEvent(new CustomEvent("refresh"));
+    });
   });
 }

@@ -30,49 +30,103 @@ async function verifyUser(request, env) {
   }
 }
 
-// Arctic Shift: posts/search supports full-text `query` (max limit 100, paginate
-// with before=<created_utc>); comments/search does NOT support `query`, so we
-// search posts only. Fan out across subreddits, paginate to perSub, dedupe.
-async function searchReddit(q, subreddits, perSub) {
-  const seen = new Set();
-  const out = [];
-  const maxPages = Math.min(Math.ceil(perSub / 100), 4);
-  await Promise.all(subreddits.map(async (sub) => {
+// Arctic Shift facts (verified live 2026-06-18):
+//  - max `limit` is 100 (101+ => HTTP 400 'limit must be between 1 and 100').
+//  - `before` = last row's created_utc paginates (sort=desc, EXCLUSIVE).
+//  - posts full-text uses `query=`; comments full-text uses `body=` (comments
+//    reject `query` with HTTP 400 'Unknown query parameter').
+//  - comments search is slow/flaky: limit=100 often 422s; limit=50 is reliable.
+//    So comments = one short attempt, soft-skipped on failure; posts paginate.
+async function searchReddit(q, subreddits, cap) {
+  const total = Math.min(Math.max(cap || 100, 1), 200);
+  const perSub = Math.min(total, Math.ceil(total / Math.max(subreddits.length, 1)) + 20);
+
+  const asJson = async (u, timeoutMs) => {
+    try {
+      const r = await fetch(u, {
+        headers: { "User-Agent": "mention-radar-discover/1.0" },
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (!r.ok) return null;
+      return (await r.json()).data || [];
+    } catch { return null; }
+  };
+
+  const pagedPosts = async (sub) => {
+    const rows = [];
     let before = null;
-    let got = 0;
-    for (let page = 0; page < maxPages && got < perSub; page++) {
+    while (rows.length < perSub) {
       const u = new URL(`${ARCTIC}/posts/search`);
       u.searchParams.set("subreddit", sub);
       u.searchParams.set("query", q);
       u.searchParams.set("sort", "desc");
       u.searchParams.set("limit", "100");
       if (before) u.searchParams.set("before", String(before));
-      let data;
-      try {
-        const r = await fetch(u, { headers: { "User-Agent": "mention-radar-discover/1.0" } });
-        if (!r.ok) break;
-        data = (await r.json()).data || [];
-      } catch { break; }
-      if (!data.length) break;
-      for (const it of data) {
-        const id = it.id || it.permalink;
-        if (id && seen.has(id)) continue;
-        if (id) seen.add(id);
-        out.push({
-          platform: "reddit", kind: "post", subreddit: sub,
-          title: it.title || null,
-          body: it.selftext || "",
-          url: "https://www.reddit.com" + (it.permalink || `/r/${sub}/`),
-          created: Number(it.created_utc) || 0,
-          score: it.score ?? null,
-        });
-        got++;
-      }
-      before = Math.min(...data.map((x) => Number(x.created_utc) || 0));
-      if (data.length < 100) break;
+      const d = await asJson(u, 12000);
+      if (!d || !d.length) break;
+      rows.push(...d);
+      if (d.length < 100) break;
+      before = d[d.length - 1].created_utc;  // exclusive cursor
     }
-  }));
-  return out;
+    return rows.map((it) => ({
+      platform: "reddit", kind: "post", subreddit: sub,
+      title: it.title || null,
+      body: it.selftext || "",
+      url: "https://www.reddit.com" + (it.permalink || `/r/${sub}/`),
+      created: Number(it.created_utc) || 0,
+      score: it.score ?? null,
+      _id: it.id || null,
+    }));
+  };
+
+  // comments full-text via body= (NOT query=); single short attempt, soft-skip.
+  const commentsPage = async (sub) => {
+    const u = new URL(`${ARCTIC}/comments/search`);
+    u.searchParams.set("subreddit", sub);
+    u.searchParams.set("body", q);
+    u.searchParams.set("sort", "desc");
+    u.searchParams.set("limit", "50");
+    const d = await asJson(u, 10000);
+    if (!d) return [];
+    return d.map((it) => ({
+      platform: "reddit", kind: "comment", subreddit: sub,
+      title: null,
+      body: it.body || "",
+      url: "https://www.reddit.com" + (it.permalink || `/r/${sub}/`),
+      created: Number(it.created_utc) || 0,
+      score: it.score ?? null,
+      _id: it.id || null,
+    }));
+  };
+
+  const runPool = async (jobs, conc) => {
+    const results = [];
+    let i = 0;
+    const worker = async () => { while (i < jobs.length) { const k = i++; results[k] = await jobs[k](); } };
+    await Promise.all(Array.from({ length: Math.min(conc, jobs.length) }, worker));
+    return results;
+  };
+
+  const jobs = [];
+  for (const sub of subreddits) {
+    jobs.push(() => pagedPosts(sub));
+    jobs.push(() => commentsPage(sub));
+  }
+  const batches = await runPool(jobs, 4);
+
+  const seen = new Set();
+  const out = [];
+  for (const batch of batches) {
+    for (const it of batch) {
+      const key = it._id || it.url;
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      delete it._id;
+      out.push(it);
+    }
+  }
+  out.sort((a, b) => (b.created || 0) - (a.created || 0));
+  return out.slice(0, total);
 }
 
 // YouTube search.list: maxResults max is 50; follow nextPageToken for more.
@@ -119,7 +173,7 @@ async function discover(request, url, env) {
   const q = (url.searchParams.get("q") || "").trim();
   if (!q) return json({ error: "缺少搜尋字 q" }, 400);
   const platform = url.searchParams.get("platform") || "both";
-  const perSub = Math.min(Math.max(Number(url.searchParams.get("limit")) || 60, 1), 300);
+  const cap = Math.min(Math.max(Number(url.searchParams.get("limit")) || 120, 1), 200);
   const subs = (url.searchParams.get("subreddits") || "")
     .split(",").map((s) => s.trim().replace(/^r\//i, "")).filter(Boolean).slice(0, 8);
 
@@ -127,20 +181,18 @@ async function discover(request, url, env) {
   const tasks = [];
   if (platform !== "youtube") {
     if (subs.length) {
-      tasks.push(searchReddit(q, subs, perSub).then((r) => { result.reddit = r; }));
+      tasks.push(searchReddit(q, subs, cap).then((r) => { result.reddit = r; }));
     } else {
       result.notes.push("Reddit:未指定 subreddit(Arctic Shift 全文搜尋需指定版面)");
     }
   }
   if (platform !== "reddit") {
-    tasks.push(searchYouTube(q, Math.min(perSub, 100), env).then((y) => {
+    tasks.push(searchYouTube(q, Math.min(cap, 100), env).then((y) => {
       result.youtube = y.items;
       if (y.note) result.notes.push(y.note);
     }));
   }
-  await Promise.all(tasks);
-  result.reddit.sort((a, b) => (b.created || 0) - (a.created || 0));
-  result.reddit = result.reddit.slice(0, 250);  // cap payload
+  await Promise.all(tasks);  // searchReddit already dedupes, sorts, caps
   return json(result, 200);
 }
 
