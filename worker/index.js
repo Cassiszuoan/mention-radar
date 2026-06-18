@@ -30,61 +30,87 @@ async function verifyUser(request, env) {
   }
 }
 
-async function searchReddit(q, subreddits, limit) {
+// Arctic Shift: posts/search supports full-text `query` (max limit 100, paginate
+// with before=<created_utc>); comments/search does NOT support `query`, so we
+// search posts only. Fan out across subreddits, paginate to perSub, dedupe.
+async function searchReddit(q, subreddits, perSub) {
+  const seen = new Set();
   const out = [];
-  await Promise.all(subreddits.flatMap((sub) =>
-    ["posts", "comments"].map(async (kind) => {
+  const maxPages = Math.min(Math.ceil(perSub / 100), 4);
+  await Promise.all(subreddits.map(async (sub) => {
+    let before = null;
+    let got = 0;
+    for (let page = 0; page < maxPages && got < perSub; page++) {
+      const u = new URL(`${ARCTIC}/posts/search`);
+      u.searchParams.set("subreddit", sub);
+      u.searchParams.set("query", q);
+      u.searchParams.set("sort", "desc");
+      u.searchParams.set("limit", "100");
+      if (before) u.searchParams.set("before", String(before));
+      let data;
       try {
-        const u = new URL(`${ARCTIC}/${kind}/search`);
-        u.searchParams.set("subreddit", sub);
-        u.searchParams.set("query", q);
-        u.searchParams.set("sort", "desc");
-        u.searchParams.set("limit", String(limit));
         const r = await fetch(u, { headers: { "User-Agent": "mention-radar-discover/1.0" } });
-        if (!r.ok) return;
-        const data = (await r.json()).data || [];
-        for (const it of data) {
-          out.push({
-            platform: "reddit",
-            kind: kind === "posts" ? "post" : "comment",
-            subreddit: sub,
-            title: it.title || null,
-            body: it.selftext || it.body || "",
-            url: "https://www.reddit.com" + (it.permalink || `/r/${sub}/`),
-            created: Number(it.created_utc) || 0,
-            score: it.score ?? null,
-          });
-        }
-      } catch { /* skip this source */ }
-    })));
+        if (!r.ok) break;
+        data = (await r.json()).data || [];
+      } catch { break; }
+      if (!data.length) break;
+      for (const it of data) {
+        const id = it.id || it.permalink;
+        if (id && seen.has(id)) continue;
+        if (id) seen.add(id);
+        out.push({
+          platform: "reddit", kind: "post", subreddit: sub,
+          title: it.title || null,
+          body: it.selftext || "",
+          url: "https://www.reddit.com" + (it.permalink || `/r/${sub}/`),
+          created: Number(it.created_utc) || 0,
+          score: it.score ?? null,
+        });
+        got++;
+      }
+      before = Math.min(...data.map((x) => Number(x.created_utc) || 0));
+      if (data.length < 100) break;
+    }
+  }));
   return out;
 }
 
-async function searchYouTube(q, limit, env) {
+// YouTube search.list: maxResults max is 50; follow nextPageToken for more.
+// Each page costs 100 quota units (cap pages to stay friendly to the 10k/day).
+async function searchYouTube(q, want, env) {
   if (!env.YT_API_KEY) return { items: [], note: "YouTube 未啟用:Worker 尚未設定 YT_API_KEY secret" };
+  const items = [];
+  let pageToken = "";
+  const maxPages = Math.min(Math.ceil(want / 50), 2);
   try {
-    const u = new URL("https://www.googleapis.com/youtube/v3/search");
-    u.searchParams.set("part", "snippet");
-    u.searchParams.set("q", q);
-    u.searchParams.set("type", "video");
-    u.searchParams.set("order", "date");
-    u.searchParams.set("maxResults", String(Math.min(limit, 15)));
-    u.searchParams.set("key", env.YT_API_KEY);
-    const r = await fetch(u);
-    if (!r.ok) return { items: [], note: "YouTube 查詢失敗 HTTP " + r.status };
-    const data = await r.json();
-    const items = (data.items || []).map((v) => ({
-      platform: "youtube",
-      kind: "video",
-      title: v.snippet?.title || "",
-      body: v.snippet?.description || "",
-      url: "https://www.youtube.com/watch?v=" + (v.id?.videoId || ""),
-      channel: v.snippet?.channelTitle || "",
-      created: v.snippet?.publishedAt || null,
-    }));
+    for (let page = 0; page < maxPages; page++) {
+      const u = new URL("https://www.googleapis.com/youtube/v3/search");
+      u.searchParams.set("part", "snippet");
+      u.searchParams.set("q", q);
+      u.searchParams.set("type", "video");
+      u.searchParams.set("order", "relevance");
+      u.searchParams.set("maxResults", "50");
+      if (pageToken) u.searchParams.set("pageToken", pageToken);
+      u.searchParams.set("key", env.YT_API_KEY);
+      const r = await fetch(u);
+      if (!r.ok) return { items, note: items.length ? null : "YouTube 查詢失敗 HTTP " + r.status };
+      const data = await r.json();
+      for (const v of data.items || []) {
+        items.push({
+          platform: "youtube", kind: "video",
+          title: v.snippet?.title || "",
+          body: v.snippet?.description || "",
+          url: "https://www.youtube.com/watch?v=" + (v.id?.videoId || ""),
+          channel: v.snippet?.channelTitle || "",
+          created: v.snippet?.publishedAt || null,
+        });
+      }
+      pageToken = data.nextPageToken || "";
+      if (!pageToken) break;
+    }
     return { items };
   } catch (e) {
-    return { items: [], note: "YouTube 例外:" + (e?.message || "unknown") };
+    return { items, note: items.length ? null : "YouTube 例外:" + (e?.message || "unknown") };
   }
 }
 
@@ -93,7 +119,7 @@ async function discover(request, url, env) {
   const q = (url.searchParams.get("q") || "").trim();
   if (!q) return json({ error: "缺少搜尋字 q" }, 400);
   const platform = url.searchParams.get("platform") || "both";
-  const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 10, 1), 25);
+  const perSub = Math.min(Math.max(Number(url.searchParams.get("limit")) || 60, 1), 300);
   const subs = (url.searchParams.get("subreddits") || "")
     .split(",").map((s) => s.trim().replace(/^r\//i, "")).filter(Boolean).slice(0, 8);
 
@@ -101,19 +127,20 @@ async function discover(request, url, env) {
   const tasks = [];
   if (platform !== "youtube") {
     if (subs.length) {
-      tasks.push(searchReddit(q, subs, limit).then((r) => { result.reddit = r; }));
+      tasks.push(searchReddit(q, subs, perSub).then((r) => { result.reddit = r; }));
     } else {
       result.notes.push("Reddit:未指定 subreddit(Arctic Shift 全文搜尋需指定版面)");
     }
   }
   if (platform !== "reddit") {
-    tasks.push(searchYouTube(q, limit, env).then((y) => {
+    tasks.push(searchYouTube(q, Math.min(perSub, 100), env).then((y) => {
       result.youtube = y.items;
       if (y.note) result.notes.push(y.note);
     }));
   }
   await Promise.all(tasks);
   result.reddit.sort((a, b) => (b.created || 0) - (a.created || 0));
+  result.reddit = result.reddit.slice(0, 250);  // cap payload
   return json(result, 200);
 }
 

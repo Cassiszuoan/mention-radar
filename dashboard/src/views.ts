@@ -607,7 +607,7 @@ export async function renderDiscover(
     if (!state.q) { results.innerHTML = `<div class="empty">請輸入搜尋字</div>`; return; }
     results.innerHTML = `<div class="empty">即時搜尋中…(可能要幾秒)</div>`;
     try {
-      const r = await api.discover({ q: state.q, platform: state.platform, subreddits: state.subreddits, limit: 10 });
+      const r = await api.discover({ q: state.q, platform: state.platform, subreddits: state.subreddits, limit: 80 });
       const items = [...(r.reddit ?? []), ...(r.youtube ?? [])];
       const notes = r.notes?.length ? `<div class="hint">${r.notes.map(esc).join(" · ")}</div>` : "";
       if (!items.length) { results.innerHTML = notes + `<div class="empty">查無即時結果</div>`; return; }
